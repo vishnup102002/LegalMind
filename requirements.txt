@@ -1,0 +1,16 @@
+# Core dependencies for LegalMind
+neo4j>=5.15.0
+qdrant-client>=1.7.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+langgraph>=0.0.30
+transformers>=4.40.0
+sentence-transformers>=2.7.0
+pydantic>=2.6.0
+jinja2>=3.1.0
+weasyprint>=61.0
+playwright>=1.42.0
+torch
+numpy
+# pyav>=12.0.0 (optional: commented out as it lacks pre-built wheels for Python 3.14 on macOS ARM64)
+python-dotenv>=1.0.0
