@@ -1,49 +1,94 @@
-LegalMind: The Asymmetrical Justice Engine (Voice-to-Voice Edition)
-LegalMind is an independent, production-grade AI systems architecture designed to bridge the gap in legal equity for low-literacy and marginalized populations. It functions as an Asymmetrical Justice Engine—converting unstructured, conversational regional voice queries into deterministic, legally grounded audio instructions and verified, printable formal documents.
 
-By separating Behavioral Audio Orchestration (Voice-to-Voice) from Structural Context Trees (RAPTOR), an Immutable Knowledge Graph (Neo4j), and a Fine-Tuned Local LLM via QLoRA (Unsloth), LegalMind eliminates legal hallucinations using a strict, token-level Citation Faithfulness Shield.
+# ⚖️ LegalMind: The Asymmetrical Justice Engine
 
-🛠️ System Architecture
-[User Regional Voice Input] 
-           │
-           ▼ (Streaming via WebRTC / FastAPI)
-[Speech-to-Text (ASR) Gateway] ➔ Shrutam-2 (Conformer + MoE Decoder)
-           │
-           ▼ (Raw Regional Malayalam Text)
-[Local Intent Extractor (Qwen-2.5-0.5B)] ➔ Maps colloquial panic to structural intent/locale keys
-           │
-           ▼ (State Routing via LangGraph)
-[Hierarchical Graph Retrieval] ➔ Dual-Engine Query (Neo4j GraphRAG + Qdrant BM25)
-           │
-           ▼ (Context Filtering via BGE-Reranker-Large)
-[Fine-Tuned Local Model (Llama-3.1-8B / vLLM)] ➔ Enforces Extractive Citation Constraints
-           │
-           ├──► [Deliverable 1: Remedial Roadmap Text] ──► [Text-to-Speech (TTS): Sooktam-2] ──► [Expressive Audio Out]
-           │
-           └──► [Deliverable 2: Formal Legal Document] ──► [Structured Text Interface & PDF Print Engine]
-The system operates across three core execution layers:
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Stateful%20Agents-00C853?style=for-the-badge&logo=langchain&logoColor=white)](https://langchain-ai.github.io/langgraph/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-Backend-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![vLLM](https://img.shields.io/badge/vLLM-High--Throughput%20Serving-orange?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/vllm-project/vllm)
+[![Neo4j](https://img.shields.io/badge/Neo4j-GraphRAG-008CC1?style=for-the-badge&logo=neo4j&logoColor=white)](https://neo4j.com/)
 
-The Voice-to-Voice (V2V) Gateway: Transcribes casual regional speech (e.g., Malayalam) using the sovereign Shrutam-2 model (Conformer + MoE architecture). A tiny local model (Qwen-2.5-0.5B) extracts structural keys (incident_type: illegal_eviction). After processing, the conversational remedial roadmap is streamed back instantly as high-fidelity, natural audio using Sooktam-2 to guarantee accessibility for illiterate users.
+> **LegalMind** is an independent, production-grade AI systems architecture designed to bridge the gap in legal equity for low-literacy and marginalized populations. Operating as an **Asymmetrical Justice Engine**, it converts unstructured, conversational regional voice queries into deterministic, legally grounded audio instructions and verified, printable formal documents. By decoupling Behavioral Audio Orchestration (Voice-to-Voice) from Structural Context Trees (RAPTOR), an Immutable Knowledge Graph (Neo4j), and a fine-tuned local LLM (Unsloth), LegalMind eliminates legal hallucinations via a token-level Citation Faithfulness Shield.
 
-The Knowledge Network: Executes an advanced multi-hop retrieval loop. It combines RAPTOR recursive summarization trees with a Neo4j dependency graph (Statute -> Section -> Case Precedent) and a Qdrant lexical index to ensure all relevant systemic boundaries are caught.
+---
 
-The Inference Engine: A lightweight local model hosted via vLLM with permanent parameter weight modifications. It applies an Extractive Constraint, halting or throwing an automated flag (UNVERIFIED_LEGAL_GROUNDS) if the retrieved document metrics are insufficient.
+## 🚀 Key Value Proposition & Architecture Overview
 
-🚀 Core Tech Stack
-Audio Streaming & Ingestion: Shrutam-2 (Speech-to-Text ASR), Sooktam-2 (Reference-guided Text-to-Speech), WebRTC / FastAPI Streaming
+Traditional legal frameworks heavily disadvantage illiterate or marginalized individuals who cannot navigate complex statutes or afford representation. **LegalMind** rebalances this symmetry:
 
-State Orchestration & Automated Ingestion: LangGraph, Playwright (automated local statutory scraping)
+- **Colloquial-to-Deterministic Mapping** — Processes raw, emotional regional dialects and maps "colloquial panic" to strict structural legal intents.
+- **Absolute Hallucination Shield** — Restricts inference to strict extractive citation constraints, short-circuiting if grounding metrics drop below target thresholds.
+- **Sovereign & Private Hosting** — Built entirely out of open, lightweight, and high-throughput local architectures, removing expensive and unsafe dependencies on corporate cloud APIs.
 
-Model Fine-Tuning & Quantization: Unsloth, Hugging Face PEFT, TRL (SFT + DPO execution)
+---
 
-Database & Retrieval Pipeline: Neo4j (GraphRAG), Qdrant (Vector + BM25 Storage), BAAI Cross-Encoders (Reranking)
+## 🤖 System Execution Layers & State Machine
 
-High-Throughput Model Serving: vLLM (Continuous batching + flash attention with prefix caching)
+LegalMind coordinates data orchestration across three specialized execution layers within a stateful, cyclic workflow built on LangGraph:
 
-Evaluation Framework: RAGAS + Context-Noise Ablation Suites
+```mermaid
+graph TD
+    Start((User Regional Voice Input)) -->|Streaming via WebRTC / FastAPI| STTNode[🗣️ STT Gateway\nShrutam-2 Conformer + MoE]
+    STTNode -->|Raw Regional Malayalam Text| IntentNode[🧠 Local Intent Extractor\nQwen-2.5-0.5B Intent Parser]
+    IntentNode -->|State Routing via LangGraph| RetrievalEngine[🔍 Hierarchical Graph Retrieval\nNeo4j GraphRAG + Qdrant BM25]
+    RetrievalEngine -->|Context Filtering| RerankNode[🎯 BGE-Reranker-Large\nSimilarity Threshold Validation]
+    RerankNode -->|Validated Context Score >= 0.72| InferenceNode[⚡ Fine-Tuned Local LLM\nLlama-3.1-8B via vLLM]
+    RerankNode -->|Context Score < 0.72| ShortCircuit[🚨 Citation Faithfulness Shield\nOutput: UNVERIFIED_LEGAL_GROUNDS]
+    
+    InferenceNode --> Deliverable1[📻 Deliverable 1: Remedial Roadmap Text]
+    InferenceNode --> Deliverable2[📄 Deliverable 2: Formal Legal Document]
+    
+    Deliverable1 --> TTSNode[🔊 TTS Renderer: Sooktam-2] --> AudioOut((Expressive Audio Out))
+    Deliverable2 --> PrintEngine[🖨️ PDF Print Engine] --> DocumentOut((Formal Printable Document))
 
-📂 Project Structure
-Plaintext
+```
+
+### Core Layer Responsibilities
+
+| Execution Layer | Component Stack | Core Structural Function |
+| --- | --- | --- |
+| **🔊 Voice-to-Voice Gateway** | Shrutam-2 + Qwen-2.5-0.5B + Sooktam-2 | Streams bidirectional regional speech via WebRTC; maps conversational user panic to localized schema keys (e.g., `incident_type: illegal_eviction`); synthesizes high-fidelity, natural audio roadmaps for illiterate accessibility. |
+| **🕸️ The Knowledge Network** | RAPTOR + Neo4j + Qdrant BM25 | Executes multi-hop semantic loops linking recursive summarization trees to an immutable dependency graph (`Statute` $\rightarrow$ `Section` $\rightarrow$ `Case Precedent`) alongside dense/lexical indices. |
+| **⚡ The Inference Engine** | Llama-3.1-8B + vLLM + PEFT/QLoRA | High-throughput local text serving enforcing strict extractive constraints; applies programmatic token penalties to ensure responses strictly adhere to retrieved facts. |
+
+---
+
+## 🛠️ System Architecture & Data Flow
+
+LegalMind ensures low latency (~380ms) and data sovereignty by containerizing database components and running prefix-cached inference pipelines.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Vulnerable User
+    participant App as WebRTC / FastAPI Gateway
+    participant LG as LangGraph State Engine
+    participant DB as Hybrid Store (Neo4j + Qdrant)
+    participant LLM as vLLM (Llama-3.1-8B QLoRA)
+    
+    User->>App: Speaks colloquially (Streaming Audio)
+    App->>App: Shrutam-2 streams live transcription to text
+    App->>LG: Drops raw text token stream into state machine
+    LG->>LG: Qwen-2.5-0.5B extracts structural locale & intent keys
+    LG->>DB: Dispatches dual-engine GraphRAG + BM25 query
+    DB->>LG: Returns multi-hop statutory text & summaries
+    LG->>LG: BGE-Reranker filters context layers
+    alt Context Similarity Score < 0.72
+        LG->>User: Shorts circuit -> Plays "UNVERIFIED_LEGAL_GROUNDS" fallback audio
+    else Context Similarity Score >= 0.72
+        LG->>LLM: Forwards verified context with extractive token blocks
+        LLM->>App: Streams structured text (IRAC Format)
+        App->>User: Deliverable 1: Sooktam-2 plays instant audio roadmap
+        App->>User: Deliverable 2: Compiles & renders printable formal legal PDF
+    end
+
+```
+
+---
+
+## 📂 Project Structure
+
+```
+.
 ├── config/                  # Neo4j schema definitions and system variables
 ├── data/
 │   ├── ingestion/           # Playwright background legal portal scrapers
@@ -62,24 +107,49 @@ Plaintext
 │   ├── pipeline.py          # Master LangGraph multi-turn state machine configuration
 │   └── server.py            # FastAPI backend endpoints with vLLM streaming integration
 └── README.md
-⚡ Step-by-Step Installation & Ingestion
-1. Environment & Container Initialization
-Spin up your localized, private data storage layer using Docker:
 
-Bash
+```
+
+---
+
+## 📦 Local Installation & Configuration
+
+### Prerequisites
+
+* Docker & Docker Compose
+* CUDA 11.8+ Enabled GPU (Required for Unsloth & vLLM execution)
+* Python 3.11+
+
+### 1. Container Initialization
+
+Spin up your localized, air-gapped data storage layers using Docker:
+
+```bash
+# Launch immutable graph store
 docker run -d --name legalmind-neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/secure_password_123 neo4j:latest
-docker run -d --name legalmind-qdrant -p 6333:6333 qdrant/qdrant
-Configure your workspace environment variables and install core dependencies:
 
-Bash
+# Launch hybrid vector engine
+docker run -d --name legalmind-qdrant -p 6333:6333 qdrant/qdrant
+
+```
+
+### 2. Environment & Dependencies Setup
+
+Configure your isolated workspace and install the accelerated compute runtimes:
+
+```bash
 python -m venv venv
 source venv/bin/activate
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
 pip install -r requirements.txt
-2. Initializing the Database Graph Ontology
-Run the schema setup script to construct your immutable relational legal classes (Statute, Section, Precedent) inside Neo4j before feeding any files:
 
-Python
+```
+
+### 3. Initialize Database Graph Ontology
+
+Run the schema deployment script to construct database constraints and primary legal entities (`Statute`, `Section`, `Precedent`) inside Neo4j prior to running scraper workers:
+
+```python
 # database/graph_store.py
 from neo4j import GraphDatabase
 
@@ -96,11 +166,25 @@ class LegalOntologyInitializer:
 if __name__ == "__main__":
     initializer = LegalOntologyInitializer("bolt://localhost:7687", ("neo4j", "secure_password_123"))
     initializer.create_constraints()
-🏋️ Fine-Tuning Specification
-To strip out conversational filler and teach the model strict legal reasoning patterns (IRAC format: Issue, Rule, Application, Conclusion), the training configuration masks prompt tokens and optimizes exclusively on raw, bracketed legal targets.
 
-Supervised Fine-Tuning Configuration (Unsloth QLoRA)
-Python
+```
+
+Execute using:
+
+```bash
+python database/graph_store.py
+
+```
+
+---
+
+## 🏋️ Model Fine-Tuning Specification
+
+To force objective legal formatting, the supervised configuration utilizes `completion_only_loss=True` to completely mask conversational prompts, optimizing parameter weights solely on structured bracketed legal targets (**IRAC Format**: Issue, Rule, Application, Conclusion).
+
+### Supervised Fine-Tuning Execution (Unsloth QLoRA)
+
+```python
 # training/sft_train.py
 from unsloth import FastLanguageModel
 import torch
@@ -122,19 +206,28 @@ model = FastLanguageModel.get_peft_model(
     lora_dropout = 0,
     bias = "none",
 )
+# SFTTrainer pipeline initialization continues below...
 
-# Active parameters include 'completion_only_loss=True' via data collator configuration
-Preference Optimization Dataset Alignment Sample (DPO)
-JSON
+```
+
+### Alignment Dataset Sample (DPO Preference Mapping)
+
+```json
 {
   "prompt": "GENERATE FORMAL LEGAL NOTICE SUBELEMENT. Context: Section 14 of the State Rent Control Act mandates 30 days written notice.",
   "chosen": "LEGAL NOTICE DRAFT: Pursuant to Section 14 of the State Rent Control Act, you are hereby notified that your verbal eviction demand issued on [Date] constitutes an unlawful termination of tenancy. Under statutory law, a tenant cannot be dispossessed without a 30-day formal written notice...",
   "rejected": "COUNSEL RESPONSE: I understand your landlord is forcing you to leave, which is very stressful. Luckily, under Section 14 of the local rent control rules, they are required to give you a 30-day notice in writing before doing this. You should present this rule to them..."
 }
-🗣️ Voice Audio Synthesis Integration
-The system leverages Sooktam-2 via Hugging Face for synthesizing natural, expressive, and prosody-accurate audio output in regional languages like Malayalam to ensure immediate accessibility.
 
-Python
+```
+
+---
+
+## 🗣️ Voice Audio Synthesis Integration
+
+Sovereign speech generation is handled natively via Hugging Face pipelines optimizing prosody-accurate rendering for low-literacy clarity.
+
+```python
 # audio/tts_renderer.py
 from transformers import pipeline
 import torch
@@ -155,20 +248,45 @@ if __name__ == "__main__":
     generator = RemedialAudioGenerator()
     test_roadmap = "ഭയപ്പെടേണ്ട. മുപ്പത് ദിവസത്തെ രേഖാമൂലമുള്ള നോട്ടീസ് ഇല്ലാതെ നിങ്ങളുടെ ഭൂവുടമയ്ക്ക് നിങ്ങളെ ഒഴിപ്പിക്കാൻ കഴിയില്ല."
     generator.text_to_indic_speech(test_roadmap)
-📊 Evaluation & Verification Architecture
-LegalMind isolates performance metrics using an intentional Context-Noise Ablation Study inside the verification loop. We evaluate accuracy across two distinct pipeline scenarios using RAGAS matrices:
 
-Pure Context Evaluation: Providing the exact, verified statutory chunk.
+```
 
-Adversarial Noise Evaluation: Providing 1 correct statutory chunk surrounded by 3遇见 irrelevant background case summaries to measure the model's Noise Rejection Rate.
+---
 
-Markdown
+## 📊 Evaluation & Verification Architecture
+
+Performance verification is verified continuously via isolated **Context-Noise Ablation Studies** passed directly to RAGAS matrices. Testing compares pure gold-standard context blocks against heavily cluttered adversarial contexts (1 target clause obscured by 3 irrelevant local background summaries) to calculate structural noise resilience metrics.
+
 ### RAGAS Optimization Performance Summary
+
 | Benchmark Metric | Baseline System (Untuned + Naive RAG) | LegalMind Architecture |
-| :--- | :--- | :--- |
+| --- | --- | --- |
 | **Syntactical JSON/Schema Violations** | 14.2% | **0.4%** |
 | **Hallucinated Citations/Clauses** | 22.5% | **0.0% (Absolute Shield)** |
 | **Noise Vulnerability Leak Rate** | 41.0% | **1.1%** |
 | **Average Production Serving Latency** | ~2400ms (Cloud API Loops) | **~380ms (vLLM Engine)** |
-⚖️ Verification & Guardrails
-The Citation Faithfulness Shield: This model uses token-level probability constraints combined with negative log-likelihood penalty parameters. It is programmatically locked down to act as an extractive processor. If the internal similarity score mapping user inputs to the RAPTOR storage network drops below a score of 0.72, the LangGraph system intercepts the payload, shorts the pipeline circuit, and outputs STATUS: UNVERIFIED_LEGAL_GROUNDS to insulate the vulnerable end user from structural risks.
+
+---
+
+## 🔒 Security, Guardrails & Privacy Policy
+
+* **The Citation Faithfulness Shield** — Operates using negative log-likelihood penalty matrices combined with token probability locks. If internal similarity metrics mapping state properties to RAPTOR indexes drop below a hard score of `0.72`, the LangGraph loop breaks and returns `STATUS: UNVERIFIED_LEGAL_GROUNDS`.
+* **Local Sovereignty** — Zero data payloads or user voice recordings are ever serialized or dispatched to external APIs. All data processing occurs entirely within private, localized execution layers.
+
+---
+
+## 📈 Future Roadmap
+
+* [ ] **Dynamic Cross-Lingual Code-Switching** — Upgrade STT pipelines to handle mixed Manglish (Malayalam + English) input smoothly.
+* [ ] **Multi-Jurisdictional Shifting Nodes** — Dynamically adjust state schemas when crossing district-level legal variations.
+* [ ] **Hardware-Accelerated Edge Voice Deployments** — Package the transcription and intent-extraction engines into standalone edge hardware devices.
+
+---
+
+## 📜 License
+
+Licensed under the [MIT License](https://www.google.com/search?q=LICENSE). Created by **Vishnu P**.
+
+```
+
+```
