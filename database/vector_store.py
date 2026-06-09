@@ -71,12 +71,14 @@ class VectorStore:
         """
         Performs hybrid search combining vector similarity and keyword search.
         """
-        # Vector similarity search
-        vector_results = self.client.search(
+        # Vector similarity search using query_points API
+        response = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=top_k
         )
+        vector_results = response.points
+
         
         # Keyword lexical match search
         lexical_results = self.client.scroll(
