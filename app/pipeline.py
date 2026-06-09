@@ -117,14 +117,12 @@ class LegalMindPipeline:
         retrieved_contexts = []
         for doc in qdrant_results:
             # 3. For each search hit, query Neo4j for surrounding structural precedents
-            section_id = doc["id"]
-            if isinstance(section_id, str):
-                db_sec_id = section_id
-            elif isinstance(section_id, int):
+            db_sec_id = doc.get("section_id") or doc["id"]
+            if isinstance(db_sec_id, int):
                 # Fallback mapping for integer IDs (e.g. 11, 24) to full Cypher keys
-                db_sec_id = f"kerala_buildings_rent_control_1965_sec_{section_id}"
+                db_sec_id = f"kerala_buildings_rent_control_1965_sec_{db_sec_id}"
             else:
-                db_sec_id = str(section_id)
+                db_sec_id = str(db_sec_id)
             
             graph_data = self.graph_store.get_related_provisions(db_sec_id)
             
@@ -133,7 +131,8 @@ class LegalMindPipeline:
                 "text": doc["text"],
                 "citation": doc["citation"],
                 "layer_depth": doc["layer_depth"],
-                "graph_precedents": graph_data.get("citing_cases", []) if graph_data else []
+                "graph_precedents": graph_data.get("citing_cases", []) if graph_data else [],
+                "section_id": doc.get("section_id"),  # Keep reference to original section_id
             }
             retrieved_contexts.append(context_entry)
             

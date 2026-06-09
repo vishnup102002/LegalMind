@@ -107,6 +107,7 @@ class VectorStore:
                 "text": res.payload.get("text", ""),
                 "citation": res.payload.get("citation", ""),
                 "layer_depth": res.payload.get("layer_depth", 0),
+                "section_id": res.payload.get("section_id"),  # <-- Add this line
                 "type": "vector"
             })
             
@@ -119,8 +120,10 @@ class VectorStore:
                     "text": res.payload.get("text", ""),
                     "citation": res.payload.get("citation", ""),
                     "layer_depth": res.payload.get("layer_depth", 0),
+                    "section_id": res.payload.get("section_id"),  # <-- Add this line
                     "type": "lexical"
                 })
+
                 
         return merged_results
 

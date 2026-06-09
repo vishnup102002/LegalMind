@@ -17,20 +17,37 @@ class GraphStore:
     def create_constraints(self):
         """Initializes relational constraints and indices for the legal ontology."""
         queries = [
-            "CREATE CONSTRAINT statute_id_unique IF NOT EXISTS FOR (s:Statute) REQUIRE s.id IS UNIQUE",
-            "CREATE CONSTRAINT section_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
-            "CREATE CONSTRAINT case_id_unique IF NOT EXISTS FOR (c:Case) REQUIRE c.id IS UNIQUE",
-            "CREATE INDEX section_citation_idx IF NOT EXISTS FOR (s:Section) ON (s.citation)",
-            "CREATE INDEX case_name_idx IF NOT EXISTS FOR (c:Case) ON (c.name)"
+             "CREATE CONSTRAINT statute_id_unique IF NOT EXISTS FOR (s:Statute) REQUIRE s.id IS UNIQUE",
+             "CREATE CONSTRAINT section_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
+             "CREATE CONSTRAINT case_id_unique IF NOT EXISTS FOR (c:Case) REQUIRE c.id IS UNIQUE",
+             "CREATE INDEX section_citation_idx IF NOT EXISTS FOR (s:Section) ON (s.citation)",
+             "CREATE INDEX case_name_idx IF NOT EXISTS FOR (c:Case) ON (c.name)"
         ]
         with self.driver.session() as session:
             for query in queries:
                 try:
                     session.run(query)
+                     # pyrefly: ignore [parse-error]
                     logger.info(f"Executed index/constraint setup: {query}")
                 except Exception as e:
                     logger.warning(f"Failed to execute database schema instruction: {e}")
+
+            # Warm up schema to register labels/relationships and silence warnings
+            warmup_queries = [
+                "MERGE (c:Case {id: 'schema_warmup_temp'})",
+                "MERGE (sec:Section {id: 'schema_warmup_temp'})",
+                "MERGE (st:Statute {id: 'schema_warmup_temp'})",
+                "MERGE (c)-[:CITES]->(sec)",
+                "MERGE (st)-[:HAS_SECTION]->(sec)",
+                "MATCH (n {id: 'schema_warmup_temp'}) DETACH DELETE n"
+            ]
+            for query in warmup_queries:
+                try:
+                    session.run(query)
+                except Exception as e:
+                    logger.warning(f"Warmup query failed: {e}")
             print("✓ Database constraint and index structures initialized.")
+
 
     def add_statute(self, statute_id: str, title: str):
         """Creates a Statute node in the graph."""
