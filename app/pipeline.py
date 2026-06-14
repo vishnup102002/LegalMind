@@ -168,29 +168,73 @@ class LegalMindPipeline:
         }
         return {"extracted_intent": intent}
 
+    def _expand_retrieval_queries(self, english_query: str, issue_type: str = None) -> List[str]:
+        """Generate multiple targeted legal queries to improve retrieval accuracy."""
+        import json
+        queries = [english_query]  # Always include the original query
+        
+        try:
+            prompt = f"""You are a legal query expander for an Indian law retrieval system.
+
+User issue: {english_query}
+Issue type: {issue_type or 'unknown'}
+
+Generate 2 additional precise legal search queries to retrieve the most relevant
+statute sections. Focus on:
+1. The PRIMARY duty/obligation of the respondent (employer/landlord etc.) — e.g. "employer duty to pay wages on time India"
+2. The REMEDY or enforcement mechanism available to the complainant — e.g. "remedy for non-payment of wages labour court"
+
+Output ONLY valid JSON:
+{{
+  "query_1": "...",
+  "query_2": "..."
+}}"""
+            resp = self._call_ollama_api(prompt, temperature=0.0, format_json=True)
+            res_dict = json.loads(resp)
+            for key in ["query_1", "query_2"]:
+                val = res_dict.get(key, "").strip()
+                if val and val != english_query:
+                    queries.append(val)
+            logger.info(f"Expanded retrieval queries: {queries}")
+        except Exception as e:
+            logger.warning(f"Query expansion failed, using original query only: {e}")
+        
+        return queries
+
     def retrieve_context_node(self, state: LegalState) -> Dict[str, Any]:
         """
         Node 2: Embeds the English query, queries Qdrant for semantic hybrid matches,
         filtering by user jurisdiction, and queries Neo4j to fetch citing cases.
+        Uses query expansion to retrieve duty, remedy, and enforcement sections.
         """
         import re
         english_query = state["extracted_intent"]["english_query"]
         logger.info(f"Executing Universal GraphRAG retrieval for: '{english_query[:50]}'")
         
-        # 1. Embed universal English query
-        query_vector = self.model.encode(english_query).tolist()
-        
-        # 2. Query Qdrant (Hybrid search: Vector + Lexical match)
         jurisdiction = state["extracted_intent"].get("jurisdiction")
-        qdrant_results = self.vector_store.hybrid_search(
-            query_vector=query_vector, 
-            query_text=english_query, 
-            top_k=5,
-            jurisdiction=jurisdiction
-        )
+        
+        # 1. Expand query into multiple targeted legal queries
+        expanded_queries = self._expand_retrieval_queries(english_query)
+        
+        # 2. Run hybrid search for each expanded query and merge results
+        seen_ids = set()
+        all_qdrant_results = []
+        for eq in expanded_queries:
+            query_vector = self.model.encode(eq).tolist()
+            results = self.vector_store.hybrid_search(
+                query_vector=query_vector,
+                query_text=eq,
+                top_k=5,
+                jurisdiction=jurisdiction
+            )
+            for doc in results:
+                doc_id = doc.get("id")
+                if doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    all_qdrant_results.append(doc)
         
         retrieved_contexts = []
-        for doc in qdrant_results:
+        for doc in all_qdrant_results:
             # 3. Clean up the internal RAPTOR layers annotation metadata from citation
             raw_citation = doc.get("citation", "Relevant Statute")
             cleaned_citation = raw_citation.split(" (RAPTOR")[0].strip()
@@ -214,7 +258,7 @@ class LegalMindPipeline:
             }
             retrieved_contexts.append(context_entry)
             
-        logger.info(f"Retrieved {len(retrieved_contexts)} integrated contexts.")
+        logger.info(f"Retrieved {len(retrieved_contexts)} integrated contexts (from {len(expanded_queries)} expanded queries).")
         return {"retrieved_docs": retrieved_contexts}
 
     def filter_rerank_node(self, state: LegalState) -> Dict[str, Any]:
@@ -557,12 +601,6 @@ Output format:
         # --- DETERMINISTIC PYTHON ROUTING ---
         if not history:
             return "GREETING"
-        
-        if not slots.get("slots_complete"):
-            return "SLOT_FILLING"
-        
-        if not irac_delivered:
-            return "RAG_RETRIEVE"
 
         def is_valid_name(val):
             if val is None:
@@ -576,8 +614,19 @@ Output format:
 
         sender_name = slots.get("sender_name")
         recipient_name = slots.get("recipient_name")
-        if is_valid_name(sender_name) and is_valid_name(recipient_name):
-            return "NOTICE_DRAFT"
+
+        # Once IRAC roadmap has been delivered, NEVER loop back to SLOT_FILLING.
+        # Check NOTICE_DRAFT first (names provided), then fall through to LLM router.
+        if irac_delivered:
+            if is_valid_name(sender_name) and is_valid_name(recipient_name):
+                return "NOTICE_DRAFT"
+            # If IRAC delivered but names not yet provided, let LLM decide
+            # (NOTICE_INTAKE, NOTICE_OFFER, FOLLOWUP, etc.) — do NOT return SLOT_FILLING.
+        else:
+            # Before IRAC delivery, normal slot-filling flow
+            if not slots.get("slots_complete"):
+                return "SLOT_FILLING"
+            return "RAG_RETRIEVE"
 
         # Format history so far
         history_lines = []
@@ -725,6 +774,9 @@ Output format:
         os.makedirs(output_dir, exist_ok=True)
         pdf_path = os.path.join(output_dir, "formal_notice.pdf")
         
+        from datetime import date
+        notice_date = date.today().strftime("%d %B %Y")
+        
         html_content = f"""
         <html>
         <head>
@@ -739,7 +791,7 @@ Output format:
         <body>
             <div class="header">FORMAL LEGAL NOTICE</div>
             <div class="meta">
-                <p><strong>Date:</strong> 10th June 2026</p>
+                <p><strong>Date:</strong> {notice_date}</p>
                 <p><strong>From (Sender):</strong> {sender}</p>
                 <p><strong>To (Recipient):</strong> {recipient}</p>
             </div>
@@ -886,6 +938,9 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     except Exception:
                         statutes_cited = "Kerala Prohibition Of Ragging Act, 1998"
                     
+                    from datetime import date
+                    notice_date = date.today().strftime("%d %B %Y")
+                    
                     draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
 
 Your task is to draft a FORMAL LEGAL NOTICE — a structured 
@@ -893,19 +948,27 @@ official document used to assert legal rights and demand remedy.
 This is NOT a threatening letter. It is a legally recognized 
 document used in Indian courts and institutions.
 
-Use the following gathered facts:
+CRITICAL RULES:
+- Use ONLY the information provided below.
+- If any field (such as address) is NOT provided, write "[TO BE FILLED BY SENDER]" as a placeholder.
+- NEVER invent, assume, or fabricate addresses, phone numbers, or any personal details.
+- The date of this notice is: {notice_date}
+
+Gathered facts:
 - Issue type: {session_slots.get('issue_type')}
 - Incident date: {session_slots.get('incident_date')}
 - Institution: {session_slots.get('institution')}
 - Jurisdiction: {session_slots.get('jurisdiction')}
 - Incident description: {session_slots.get('incident_description')}
 - Sender (complainant): {sender_name}
+- Sender address: [TO BE FILLED BY SENDER]
 - Recipient (respondent): {recipient_name}
+- Recipient address: [TO BE FILLED BY SENDER]
 
 Applicable law from assessment: {statutes_cited}
 
 Draft a formal legal notice with these sections:
-1. Header (date, sender address placeholder, recipient address)
+1. Header (date: {notice_date}, sender address placeholder, recipient address placeholder)
 2. Subject line
 3. Facts (numbered, objective language only)
 4. Legal violations (cite the exact statutes from assessment)
@@ -916,6 +979,7 @@ Draft a formal legal notice with these sections:
 Language: formal, objective, third-person where appropriate.
 DO NOT include threats of physical harm.
 DO NOT add any content not in the gathered facts.
+DO NOT invent addresses — use [TO BE FILLED BY SENDER] for any unknown address.
 DO NOT refuse to draft this — it is a civil legal document."""
                     draft = self._call_ollama_api(draft_prompt, temperature=0.3)
                     download_url = self.generate_notice_document_file(draft, sender_name, recipient_name)
