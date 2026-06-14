@@ -67,30 +67,48 @@ class VectorStore:
             points=qdrant_points
         )
 
-    def hybrid_search(self, query_vector: list, query_text: str, top_k: int = 5):
+    def hybrid_search(self, query_vector: list, query_text: str, top_k: int = 5, jurisdiction: str = None):
         """
-        Performs hybrid search combining vector similarity and keyword search.
+        Performs hybrid search combining vector similarity and keyword search, filtering by jurisdiction.
         """
+        query_filter = None
+        if jurisdiction:
+            jurisdiction_lower = jurisdiction.lower()
+            query_filter = models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="jurisdiction",
+                        match=models.MatchValue(value="central")
+                    ),
+                    models.FieldCondition(
+                        key="jurisdiction",
+                        match=models.MatchValue(value=jurisdiction_lower)
+                    )
+                ]
+            )
+
         # Vector similarity search using query_points API
         response = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
+            query_filter=query_filter,
             limit=top_k
         )
         vector_results = response.points
 
-        
         # Keyword lexical match search
+        must_conditions = [
+            models.FieldCondition(
+                key="text",
+                match=models.MatchText(text=query_text)
+            )
+        ]
+        if query_filter:
+            must_conditions.append(query_filter)
+
         lexical_results = self.client.scroll(
             collection_name=self.collection_name,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="text",
-                        match=models.MatchText(text=query_text)
-                    )
-                ]
-            ),
+            scroll_filter=models.Filter(must=must_conditions),
             limit=top_k
         )[0]
         

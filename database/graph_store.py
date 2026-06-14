@@ -49,15 +49,15 @@ class GraphStore:
             print("✓ Database constraint and index structures initialized.")
 
 
-    def add_statute(self, statute_id: str, title: str):
+    def add_statute(self, statute_id: str, title: str, jurisdiction: str = "Central"):
         """Creates a Statute node in the graph."""
         query = """
         MERGE (s:Statute {id: $id})
-        SET s.title = $title
+        SET s.title = $title, s.jurisdiction = $jurisdiction
         RETURN s
         """
         with self.driver.session() as session:
-            session.run(query, id=statute_id, title=title)
+            session.run(query, id=statute_id, title=title, jurisdiction=jurisdiction)
 
     def add_section(self, statute_id: str, section_id: str, title: str, text: str, citation: str):
         """Creates a Section node linked to its parent Statute."""

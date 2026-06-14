@@ -5,8 +5,10 @@ import uuid
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from typing import List, Dict, Any
 from pydantic import BaseModel
 import logging
 from dotenv import load_dotenv
@@ -29,15 +31,24 @@ vector_store = VectorStore()
 transcriber = ShrutamAudioTranscriber()
 tts_generator = RemedialAudioGenerator()
 pipeline = LegalMindPipeline(threshold=float(os.getenv("CITATION_FAITHFULNESS_THRESHOLD", 0.72)))
+from data.processing.raptor_processor import RaptorProcessor
+raptor_processor = RaptorProcessor()
 
 class IngestRequest(BaseModel):
     statute_id: str
     title: str
     text: str
+    jurisdiction: str = "Central"
 
 # Models
+class Message(BaseModel):
+    role: str
+    text: str
+
 class QueryRequest(BaseModel):
     query: str
+    history: List[Message] = []
+    threshold: float = None
 
 class QueryResponse(BaseModel):
     status: str
@@ -97,7 +108,8 @@ async def health_check():
 async def query_legalmind(request: QueryRequest):
     """Triggers the LangGraph state machine flow with user's legal inquiry."""
     try:
-        result = pipeline.run(request.query)
+        history_list = [{"role": m.role, "text": m.text} for m in request.history]
+        result = pipeline.run(request.query, history=history_list, threshold=request.threshold)
         return QueryResponse(
             status=result["status"],
             response_text=result["response_text"],
@@ -118,6 +130,46 @@ async def transcribe_audio(file_path: str):
     
     transcript = transcriber.transcribe(audio_data)
     return {"transcript": transcript}
+
+@app.post("/api/voice/transcribe-file")
+async def transcribe_file(file: UploadFile = File(...)):
+    """Transcribe uploaded audio file bytes directly using Shrutam-2."""
+    try:
+        audio_bytes = await file.read()
+        transcript = transcriber.transcribe(audio_bytes)
+        return {"transcript": transcript}
+    except Exception as e:
+        logger.error(f"Error during audio file transcription: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/voice/speak")
+async def speak_text(text: str, background_tasks: BackgroundTasks):
+    """Convert text to speech and return WAV audio stream using Sooktam-2."""
+    try:
+        import tempfile
+        from fastapi.responses import FileResponse
+        os.makedirs("data/tmp", exist_ok=True)
+        # Create a temp file to store output audio
+        temp_file = tempfile.NamedTemporaryFile(suffix=".wav", dir="data/tmp", delete=False)
+        temp_file_path = temp_file.name
+        temp_file.close()
+        
+        # Render audio to temp path
+        tts_generator.text_to_indic_speech(text, temp_file_path)
+        
+        # Background task to clean up temp file after serving
+        def cleanup():
+            try:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+            except Exception as e:
+                logger.warning(f"Error cleaning up temp voice file: {e}")
+                
+        background_tasks.add_task(cleanup)
+        return FileResponse(temp_file_path, media_type="audio/wav")
+    except Exception as e:
+        logger.error(f"Error during speech synthesis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/voice/webrtc-offer")
 async def webrtc_offer(sdp_offer: dict):
@@ -186,6 +238,20 @@ async def generate_document(request: DocumentRequest, background_tasks: Backgrou
             f.write(html_content)
         return {"status": "SUCCESS", "download_url": f"/api/documents/download?file=formal_notice.txt"}
 
+@app.get("/api/documents/download")
+async def download_document(file: str):
+    """Securely download generated PDF or TXT legal documents."""
+    from fastapi.responses import FileResponse
+    # Simple directory traversal prevention
+    if ".." in file or "/" in file or "\\" in file:
+        raise HTTPException(status_code=400, detail="Invalid document path requested.")
+    
+    file_path = os.path.join("data/synthesis", file)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Requested file was not found.")
+        
+    return FileResponse(file_path, filename=file)
+
 @app.post("/api/documents/ingest")
 async def ingest_document(request: IngestRequest):
     """
@@ -194,9 +260,8 @@ async def ingest_document(request: IngestRequest):
     generates embeddings, inserts sections/statutes to Neo4j, and upserts chunks to Qdrant.
     """
     try:
-        # Initialize RaptorProcessor
-        from data.processing.raptor_processor import RaptorProcessor
-        raptor = RaptorProcessor()
+        # Use RaptorProcessor singleton
+        raptor = raptor_processor
         
         # Parse text into sections using regex
         text = request.text
@@ -212,7 +277,7 @@ async def ingest_document(request: IngestRequest):
             matches = [("1", "General Provisions", text)]
             
         # Store Statute in Neo4j
-        graph_store.add_statute(request.statute_id, request.title)
+        graph_store.add_statute(request.statute_id, request.title, request.jurisdiction)
         
         total_chunks = 0
         for sec_num, sec_title, sec_body in matches:
@@ -250,7 +315,8 @@ async def ingest_document(request: IngestRequest):
                             "text": chunk,
                             "citation": f"Section {sec_num}, {request.title} (RAPTOR Layer {layer})",
                             "layer_depth": layer,
-                            "section_id": section_id
+                            "section_id": section_id,
+                            "jurisdiction": request.jurisdiction.lower()
                         }
                     })
             
@@ -268,6 +334,15 @@ async def ingest_document(request: IngestRequest):
 
 
 
+
+# Serve static files and mount index.html at root "/"
+os.makedirs("app/static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+@app.get("/")
+async def read_index():
+    from fastapi.responses import FileResponse
+    return FileResponse("app/static/index.html")
 
 if __name__ == "__main__":
     import uvicorn

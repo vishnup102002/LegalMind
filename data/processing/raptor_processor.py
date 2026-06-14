@@ -7,8 +7,24 @@ logger = logging.getLogger("LegalMind.Processing.RAPTOR")
 
 class RaptorProcessor:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.encoder = SentenceTransformer(model_name)
+        self.encoder = SentenceTransformer(model_name, local_files_only=True)
         logger.info(f"Loaded embedding encoder: {model_name}")
+        
+        # Test if local vLLM is available
+        self.vllm_url = os.getenv("VLLM_API_URL", "http://localhost:8000/v1")
+        self.vllm_model = os.getenv("VLLM_MODEL_NAME", "unsloth/llama-3.1-8b-instruct-bnb-4bit")
+        self.vllm_available = False
+        
+        if self.vllm_url and self.vllm_url.lower() != "none":
+            import urllib.request
+            try:
+                # Quick health check using /models or /health
+                with urllib.request.urlopen(f"{self.vllm_url}/models", timeout=0.5) as response:
+                    if response.status == 200:
+                        self.vllm_available = True
+                        logger.info("✓ Local vLLM server detected and active.")
+            except Exception:
+                logger.info("Local vLLM server unreachable. Using centroid-based extractive summarization.")
 
     def chunk_text(self, text: str, chunk_size: int = 512, overlap: int = 50) -> list[str]:
         """Splits raw legal text into leaf node chunks of specified token lengths."""
@@ -42,13 +58,86 @@ class RaptorProcessor:
 
     def summarize_cluster(self, cluster_chunks: list[str]) -> str:
         """
-        Synthesizes abstractive summaries of clustered topics.
-        Can call local vLLM or fallback to extractive template.
+        Synthesizes abstractive or high-quality extractive summaries of clustered topics.
+        First attempts to contact a configured local vLLM API, and if unavailable,
+        falls back to a centroid-based embedding extractive summarization using the
+        pre-loaded SentenceTransformer encoder.
         """
-        # In production, this would invoke Llama-3.1-8B via the local vLLM / Ollama server
-        context_block = "\n---\n".join(cluster_chunks[:3])
-        summary = f"SUMMARY OF PROVISIONS AND PRECEDENTS:\nThis cluster outlines legal boundaries regarding tenants' protection rules and unlawful evictions: {context_block[:200]}..."
-        return summary
+        if not cluster_chunks:
+            return ""
+
+        # Try to use local vLLM if configured and running
+        if self.vllm_available:
+            prompt = (
+                "You are a legal summarization assistant. Synthesize a concise, single-sentence summary of the following legal provisions:\n\n"
+                + "\n".join(cluster_chunks)
+                + "\n\nSummary:"
+            )
+            
+            import urllib.request
+            import json
+            
+            try:
+                req = urllib.request.Request(
+                    f"{self.vllm_url}/completions",
+                    data=json.dumps({
+                        "model": self.vllm_model,
+                        "prompt": prompt,
+                        "max_tokens": 128,
+                        "temperature": 0.0
+                    }).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    vllm_summary = res_data['choices'][0]['text'].strip()
+                    if vllm_summary:
+                        return f"SUMMARY OF PROVISIONS AND PRECEDENTS:\n{vllm_summary}"
+            except Exception:
+                pass
+
+        # Fallback to Centroid-based Extractive Summarization using pre-loaded self.encoder
+        try:
+            # Embed all chunks in the cluster
+            embeddings = self.encoder.encode(cluster_chunks)
+            if len(embeddings.shape) == 1:
+                embeddings = embeddings.reshape(1, -1)
+            
+            # Compute centroid embedding
+            centroid = np.mean(embeddings, axis=0)
+            
+            # Compute cosine similarities between each chunk and the centroid
+            centroid_norm = np.linalg.norm(centroid)
+            similarities = []
+            for i, emb in enumerate(embeddings):
+                emb_norm = np.linalg.norm(emb)
+                if centroid_norm > 0 and emb_norm > 0:
+                    similarity = np.dot(emb, centroid) / (centroid_norm * emb_norm)
+                else:
+                    similarity = 0.0
+                similarities.append((similarity, i))
+            
+            # Sort by similarity descending
+            similarities.sort(key=lambda x: x[0], reverse=True)
+            
+            # Select top 2 most representative chunks
+            top_indices = [idx for _, idx in similarities[:2]]
+            representative_sentences = [cluster_chunks[idx].strip() for idx in top_indices]
+            
+            # Form clean summary
+            summary_content = " ".join(representative_sentences)
+            # Ensure it is not too long but informative
+            if len(summary_content) > 300:
+                summary_content = summary_content[:300] + "..."
+            
+            return f"SUMMARY OF PROVISIONS AND PRECEDENTS:\n{summary_content}"
+        except Exception as e:
+            logger.warning(f"Centroid summarization failed: {e}. Falling back to basic concatenation.")
+            fallback_text = " ".join([c.strip() for c in cluster_chunks[:2]])
+            if len(fallback_text) > 300:
+                fallback_text = fallback_text[:300] + "..."
+            return f"SUMMARY OF PROVISIONS AND PRECEDENTS:\n{fallback_text}"
 
     def build_tree(self, text: str, max_layers: int = 3) -> dict:
         """

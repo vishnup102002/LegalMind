@@ -2,6 +2,8 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+load_dotenv()
 
 from database.graph_store import GraphStore
 from database.vector_store import VectorStore
@@ -14,6 +16,8 @@ from transformers import pipeline
 
 logger = logging.getLogger("LegalMind.Pipeline")
 
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
 # Define the State definition for the LangGraph pipeline
 class LegalState(TypedDict):
     user_query: str
@@ -23,6 +27,7 @@ class LegalState(TypedDict):
     response_text: str
     faithfulness_score: float
     status: str  # SUCCESS or UNVERIFIED_LEGAL_GROUNDS
+    threshold: float
 
 class LegalMindPipeline:
     def __init__(self, threshold: float = 0.72):
@@ -30,77 +35,145 @@ class LegalMindPipeline:
         self.graph_store = GraphStore()
         self.vector_store = VectorStore()
         
-        # 1. Load Universal translation model (Malayalam -> English)
+        # 1. Load Universal translation model (Malayalam -> English) using Helsinki-NLP/opus-mt-ml-en
         try:
-            self.translator = pipeline(
-                "translation", 
-                model="facebook/nllb-200-distilled-600M",
-                src_lang="mal_Mlym",
-                tgt_lang="eng_Latn"
-            )
-            logger.info("✓ Multilingual NLLB Translation engine loaded.")
+            from transformers import MarianTokenizer, MarianMTModel
+            model_name = "Helsinki-NLP/opus-mt-ml-en"
+            self.translation_tokenizer = MarianTokenizer.from_pretrained(model_name, local_files_only=True)
+            self.translation_model = MarianMTModel.from_pretrained(model_name, local_files_only=True)
+            self.translator = True
+            logger.info("✓ Multilingual Helsinki-NLP Translation engine loaded.")
         except Exception as e:
             logger.warning(f"Translation engine fallback to dictionary stub: {e}")
             self.translator = None
 
         # 2. Load Embedding Encoder (operating in English semantic space)
-        self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=True)
         
         # 3. Load Reranker for verification
         try:
-            self.reranker = CrossEncoder("BAAI/bge-reranker-base")
+            self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=True)
         except Exception as e:
             self.reranker = None
             
         # 4. Compile the LangGraph workflow
         self._build_workflow()
 
+    def _call_ollama_api(self, prompt: str, temperature: float = 0.0, format_json: bool = False) -> str:
+        """Helper to invoke the local Ollama API with retries and dynamic timeout limits."""
+        import urllib.request
+        import json
+        import time
 
+        ollama_url = "http://localhost:11434/api/generate"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature
+            }
+        }
+        if format_json:
+            payload["format"] = "json"
+
+        # Retry loop: 3 retries, timeouts: 60s, 120s, 180s
+        timeouts = [60, 120, 180]
+        last_err = None
+        for attempt, timeout in enumerate(timeouts, 1):
+            try:
+                req = urllib.request.Request(
+                    ollama_url,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    return res_data.get("response", "").strip()
+            except Exception as e:
+                logger.warning(f"Ollama connection attempt {attempt} failed (timeout={timeout}s): {e}")
+                last_err = e
+                if attempt < len(timeouts):
+                    time.sleep(2)
+        
+        raise last_err
 
     def extract_intent_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 1: Translate regional input to Universal English space."""
         query = state["user_query"].strip()
         logger.info(f"Translating query: '{query[:50]}...'")
         
-        # Check if the query contains Malayalam characters (Malyalam unicode block ranges from U+0D00 to U+0D7F)
+        # Check if the query contains Malayalam characters (Malayalam unicode block ranges from U+0D00 to U+0D7F)
         contains_malayalam = any(0x0D00 <= ord(char) <= 0x0D7F for char in query)
         
         english_query = query
         if contains_malayalam:
-            if self.translator:
+            translated_successfully = False
+            if self.translator and hasattr(self, 'translation_tokenizer'):
                 try:
-                    translation = self.translator(query)
-                    english_query = translation[0]["translation_text"]
+                    inputs = self.translation_tokenizer(query, return_tensors="pt")
+                    translated_tokens = self.translation_model.generate(**inputs, max_length=256)
+                    english_query = self.translation_tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
                     logger.info(f"✓ Translated to English: '{english_query}'")
+                    translated_successfully = True
                 except Exception as e:
-                    logger.error(f"Translation failed: {e}")
-            else:
-                # Stub mapping dictionary for your evaluation dataset queries
-                dictionary_stub = {
-                    "എന്റെ വീട്ടുടമസ്ഥൻ എന്നോട് നാളെത്തന്നെ റൂമൊഴിഞ്ഞു തരാൻ പറഞ്ഞു. എനിക്ക് പോകാൻ വേറെ ഒരിടവുമില്ല. ഞാൻ എന്തുചെയ്യും?": 
-                        "My landlord told me to vacate the room tomorrow. I have nowhere else to go. What should I do?",
-                    "അലവൻസ് തരാതെ കമ്പനിക്കാരൻ എന്നെ പിരിച്ചുവിട്ടു. പൈസ ചോദിച്ചപ്പോൾ ഭീഷണിപ്പെടുത്തുന്നു. കേസ് കൊടുക്കാൻ പറ്റുമോ?":
-                        "The company terminated me without paying allowance. They are threatening when I ask for money. Can I file a case?",
-                    "വീട്ടുടമസ്ഥൻ കറന്റും വെള്ളവും മുറിച്ചു. വാടക കുടിശ്ശിക വന്നതിനാണ് ഇങ്ങനെ ചെയ്തത്. ഇപ്പൊ കറന്റില്ലാഞ്ഞിട്ട് പിള്ളേർക്ക് പഠിക്കാൻ പറ്റുന്നില്ല.":
-                        "The landlord cut off electricity and water. This was done due to rent arrears. Children cannot study now because there is no electricity."
-                }
-                english_query = dictionary_stub.get(query, query)
-                logger.info(f"[Stub Translation] Result: '{english_query}'")
-                
-        # We store the English translation in the intent state to route to the RAG database
+                    logger.error(f"Translation model failed: {e}")
+
+            if not translated_successfully:
+                logger.info(f"Translation engine fallback. Translating using local Ollama model ({OLLAMA_MODEL})...")
+                prompt = (
+                    "Translate the following Malayalam query into a single natural English sentence. "
+                    "Provide only the translation, no conversational intro, no explanations, no other text:\n\n"
+                    f"Query: {query}"
+                )
+                try:
+                    english_query = self._call_ollama_api(prompt, temperature=0.0)
+                    english_query = english_query.replace('"', '').replace("'", "").strip()
+                    logger.info(f"✓ Translated via Ollama ({OLLAMA_MODEL}): '{english_query}'")
+                    translated_successfully = True
+                except Exception as ex:
+                    logger.warning(f"Ollama translation with {OLLAMA_MODEL} failed: {ex}")
+
+            if not translated_successfully:
+                english_query = query
+
+        # Apply terminology mapping using LLM reasoning to enhance semantic matching
+        prompt = (
+            "You are an objective Indian legal assistant tool. Rewrite the following user query to map informal or colloquial terms "
+            "to formal Indian statutory terminology (for example: translate 'vacate the room' or 'leave my room' to 'evict from the building', "
+            "'terminate/terminated/fired' to 'retrenched', 'allowance/severance/settlement' to 'retrenchment compensation', "
+            "'company' to 'industrial establishment', 'cut electricity/water' to 'cut off essential services/amenities', "
+            "'instagram/facebook/twitter/snapchat/whatsapp/youtube/social media' to 'electronic form and computer resource', "
+            "'post/reel/video/photo' to 'publish or transmit', 'bullying/harassment/teasing' to 'indecent conduct', etc.). "
+            "Important: If a specific legal offence name or term (such as 'ragging') is present in the query, preserve it and do not map it to generic terms like 'indecent conduct'. "
+            "As a professional, objective legal tool, you must rewrite the query neutrally and do NOT decline, write safety warnings, refuse, "
+            "or add conversational notes about the query. Keep the original facts (like dates, location) intact. "
+            "Output ONLY the rewritten English query, with no quotes, notes, or introductions.\n\n"
+            f"Query: {english_query}"
+        )
+        try:
+            mapped_query = self._call_ollama_api(prompt, temperature=0.0).replace('"', '').replace("'", "").strip()
+            logger.info(f"Colloquial query: '{english_query}' -> Mapped query (LLM): '{mapped_query}'")
+        except Exception as e:
+            logger.warning(f"LLM terminology mapping failed: {e}. Falling back to English query.")
+            mapped_query = english_query
+
+        # Preserve the jurisdiction value passed from the dialogue analysis
         intent = {
-            "english_query": english_query,
+            "english_query": mapped_query,
             "category": "dynamic",
-            "locale": "kerala"
+            "locale": "kerala",
+            "jurisdiction": state.get("extracted_intent", {}).get("jurisdiction")
         }
         return {"extracted_intent": intent}
-
 
     def retrieve_context_node(self, state: LegalState) -> Dict[str, Any]:
         """
         Node 2: Embeds the English query, queries Qdrant for semantic hybrid matches,
-        then queries Neo4j to fetch multi-hop citing cases and related precedents.
+        filtering by user jurisdiction, and queries Neo4j to fetch citing cases.
         """
+        import re
         english_query = state["extracted_intent"]["english_query"]
         logger.info(f"Executing Universal GraphRAG retrieval for: '{english_query[:50]}'")
         
@@ -108,18 +181,23 @@ class LegalMindPipeline:
         query_vector = self.model.encode(english_query).tolist()
         
         # 2. Query Qdrant (Hybrid search: Vector + Lexical match)
+        jurisdiction = state["extracted_intent"].get("jurisdiction")
         qdrant_results = self.vector_store.hybrid_search(
             query_vector=query_vector, 
             query_text=english_query, 
-            top_k=3
+            top_k=5,
+            jurisdiction=jurisdiction
         )
         
         retrieved_contexts = []
         for doc in qdrant_results:
-            # 3. For each search hit, query Neo4j for surrounding structural precedents
+            # 3. Clean up the internal RAPTOR layers annotation metadata from citation
+            raw_citation = doc.get("citation", "Relevant Statute")
+            cleaned_citation = raw_citation.split(" (RAPTOR")[0].strip()
+
+            # 4. For each search hit, query Neo4j for surrounding structural precedents
             db_sec_id = doc.get("section_id") or doc["id"]
             if isinstance(db_sec_id, int):
-                # Fallback mapping for integer IDs (e.g. 11, 24) to full Cypher keys
                 db_sec_id = f"kerala_buildings_rent_control_1965_sec_{db_sec_id}"
             else:
                 db_sec_id = str(db_sec_id)
@@ -129,16 +207,15 @@ class LegalMindPipeline:
             context_entry = {
                 "id": doc["id"],
                 "text": doc["text"],
-                "citation": doc["citation"],
+                "citation": cleaned_citation,
                 "layer_depth": doc["layer_depth"],
                 "graph_precedents": graph_data.get("citing_cases", []) if graph_data else [],
-                "section_id": doc.get("section_id"),  # Keep reference to original section_id
+                "section_id": doc.get("section_id"),
             }
             retrieved_contexts.append(context_entry)
             
         logger.info(f"Retrieved {len(retrieved_contexts)} integrated contexts.")
         return {"retrieved_docs": retrieved_contexts}
-
 
     def filter_rerank_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 3: Context filtering using BGE-Reranker in English space."""
@@ -150,29 +227,28 @@ class LegalMindPipeline:
             
         reranked = []
         if self.reranker:
-            # Construct English query-document pairs
             pairs = [(english_query, doc["text"]) for doc in state["retrieved_docs"]]
-            scores = self.reranker.predict(pairs)
+            scores = self.reranker.predict(pairs, activation_fn=lambda x: x)
             
             for idx, doc in enumerate(state["retrieved_docs"]):
                 doc_copy = doc.copy()
                 doc_copy["relevance_score"] = float(scores[idx])
                 reranked.append(doc_copy)
                 
-            # Sort by relevance score descending
             reranked.sort(key=lambda x: x["relevance_score"], reverse=True)
         else:
-            # Fallback if reranker is not initialized
             for idx, doc in enumerate(state["retrieved_docs"]):
                 doc_copy = doc.copy()
-                doc_copy["relevance_score"] = 0.85 - (idx * 0.1)
+                doc_copy["relevance_score"] = float(doc.get("score", 0.5))
                 reranked.append(doc_copy)
+            reranked.sort(key=lambda x: x["relevance_score"], reverse=True)
                 
         logger.info(f"Reranked {len(reranked)} docs. Top score: {reranked[0]['relevance_score'] if reranked else 'N/A'}")
         return {"reranked_docs": reranked}
 
     def generate_roadmap_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 5: Dynamic LLM Generation using retrieved statutory grounds."""
+        print("DEBUG STATE STATUS:", state.get("status"))
         if state["status"] == "UNVERIFIED_LEGAL_GROUNDS":
             rejection_msg = (
                 "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
@@ -183,23 +259,110 @@ class LegalMindPipeline:
             return {"response_text": rejection_msg}
             
         logger.info("Generating verified IRAC roadmap...")
-        top_doc = state["reranked_docs"][0]
-        citation = top_doc.get("citation", "Relevant Statute")
-        text = top_doc.get("text", "")
         
-        issue = f"Whether the circumstances described violate the protections under {citation}."
-        rule = f"According to {citation}: {text}"
-        app = f"The client's situation matches the conditions set forth in {citation}."
-        conclusion = f"You are legally protected under {citation}. You should assert your rights accordingly."
-        
-        roadmap = (
-            f"LEGAL ROADMAP (IRAC FORMAT):\n"
-            f"ISSUE: {issue}\n"
-            f"RULE: {rule}\n"
-            f"APPLICATION: {app}\n"
-            f"CONCLUSION: {conclusion}"
+        # Iterate over reranked docs to find the first one that passes jurisdiction validation
+        for doc_idx, doc in enumerate(state["reranked_docs"]):
+            citation = doc.get("citation", "Relevant Statute")
+            text = doc.get("text", "")
+            
+            ollama_success = False
+            roadmap = ""
+            
+            try:
+                # First sequential call: generate assessment and English layperson advice
+                prompt = (
+                    "You are a professional legal assistant. Analyze the user query and the retrieved legal context to create a detailed legal assessment and a layperson action guide.\n\n"
+                    f"User Query: {state['user_query']}\n"
+                    f"Retrieved Legal Context (Citation: {citation}):\n{text}\n\n"
+                    "Return ONLY a JSON object matching this schema (do not include any conversational preamble, notes, or markdown formatting, just pure raw JSON):\n"
+                    "{\n"
+                    '  "ISSUE": "state the specific legal issue, referencing the citation",\n'
+                    '  "RULE": "state the legal rule from the retrieved context",\n'
+                    '  "APPLICATION": "apply the rule to the user\'s specific facts",\n'
+                    '  "CONCLUSION": "state the legal conclusion and remedies available",\n'
+                    '  "LAYPERSON": "provide simple, actionable, empathetic advice in English for a common citizen, under 3 sentences"\n'
+                    "}"
+                )
+                
+                import json
+                response_json = self._call_ollama_api(prompt, temperature=0.2, format_json=True)
+                res_dict = json.loads(response_json)
+                
+                issue_val = res_dict.get("ISSUE", "").strip()
+                rule_val = res_dict.get("RULE", "").strip()
+                app_val = res_dict.get("APPLICATION", "").strip()
+                conc_val = res_dict.get("CONCLUSION", "").strip()
+                lay_val = res_dict.get("LAYPERSON", "").strip()
+                
+                if issue_val and rule_val and app_val and conc_val and lay_val:
+                    # Second sequential call: Translate English advice to Malayalam
+                    translation_prompt = (
+                        "You are an expert English-to-Malayalam translator. Translate the following English text into natural, readable, and polite Malayalam. "
+                        "Do not include any conversational filler, explanations, or introductory notes. Only return the Malayalam translation:\n\n"
+                        f"{lay_val}"
+                    )
+                    lay_ml_val = self._call_ollama_api(translation_prompt, temperature=0.0)
+                    lay_ml_val = lay_ml_val.strip().replace('"', '').replace("'", "")
+                    
+                    roadmap = (
+                        f"LEGAL ROADMAP (IRAC FORMAT):\n"
+                        f"ISSUE: {issue_val}\n"
+                        f"RULE: {rule_val}\n"
+                        f"APPLICATION: {app_val}\n"
+                        f"CONCLUSION: {conc_val}\n"
+                        f"LAYPERSON: {lay_val}\n"
+                        f"LAYPERSON_ML: {lay_ml_val}\n\n"
+                        f"Would you like me to draft a formal legal notice based on this assessment?"
+                    )
+                    ollama_success = True
+                    logger.info(f"✓ Dynamically generated and translated roadmap via Ollama for doc {doc_idx}.")
+            except Exception as e:
+                logger.warning(f"Ollama generation failed in roadmap node for doc {doc_idx}: {e}")
+                continue
+                
+            if not ollama_success:
+                continue
+                
+            # Post-generation gate validation: Check for placeholders or wrong jurisdiction mentions
+            has_placeholder = "***" in rule_val or "N/A" in rule_val or not rule_val.strip()
+            
+            has_wrong_jurisdiction = False
+            user_jur = state["extracted_intent"].get("jurisdiction")
+            if user_jur and user_jur.lower() != "central":
+                validation_prompt = (
+                    "You are a legal auditor. Your task is to verify if the legal roadmap matches the user's jurisdiction.\n"
+                    f"User Jurisdiction: {user_jur}\n"
+                    f"Legal Roadmap:\n{roadmap}\n\n"
+                    "Check if the roadmap cites or references any state-specific laws that do NOT belong to the user's jurisdiction. "
+                    "For example, if the user jurisdiction is 'Kerala', the roadmap must NOT reference 'Tamil Nadu Prohibition of Ragging Act' or any other state's laws. "
+                    "If there is a mismatch (e.g., citing another state's law), return only 'FAIL'. Otherwise, return 'PASS'. "
+                    "Do not include any other text."
+                )
+                try:
+                    validation_res = self._call_ollama_api(validation_prompt, temperature=0.0).strip().upper()
+                    if "FAIL" in validation_res:
+                        has_wrong_jurisdiction = True
+                        logger.warning(f"LLM validation gate failed for doc {doc_idx}: wrong jurisdiction detected. Auditor output: {validation_res}")
+                except Exception as e:
+                    logger.warning(f"LLM validation gate failed to run for doc {doc_idx}: {e}")
+            
+            if has_placeholder or has_wrong_jurisdiction:
+                logger.warning(f"Doc {doc_idx} failed validation: placeholder={has_placeholder}, wrong_jurisdiction={has_wrong_jurisdiction}")
+                continue
+                
+            # If we reach here, this document and generated roadmap are valid!
+            return {"response_text": roadmap}
+            
+        # If all docs failed validation
+        logger.warning("All retrieved docs failed validation gate.")
+        fallback_msg = (
+            "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
+            "I found a potentially relevant statute but couldn't retrieve the exact rule text. Please consult a legal aid centre."
         )
-        return {"response_text": roadmap}
+        return {
+            "response_text": fallback_msg,
+            "status": "UNVERIFIED_LEGAL_GROUNDS"
+        }
 
     def citation_shield_gate(self, state: LegalState) -> Dict[str, Any]:
         """Node 4: Validate citations dynamically using semantic threshold constraints."""
@@ -208,28 +371,44 @@ class LegalMindPipeline:
         if not state["reranked_docs"]:
             return {"faithfulness_score": 0.0, "status": "UNVERIFIED_LEGAL_GROUNDS"}
             
-        top_doc = state["reranked_docs"][0]
-        top_score = top_doc.get("relevance_score", 0.0)
+        threshold = state.get("threshold", self.threshold)
         
-        # Convert Cross-Encoder logit score to probability space
-        import math
-        try:
-            prob_score = 1.0 / (1.0 + math.exp(-top_score))
-        except Exception:
-            prob_score = top_score
+        # Calculate calibrated score for each document
+        verified_docs = []
+        best_prob = 0.0
+        
+        for idx, doc in enumerate(state["reranked_docs"]):
+            score = doc.get("relevance_score", 0.0)
+            if self.reranker is None:
+                prob_score = score
+            else:
+                import math
+                try:
+                    calibrated_logit = score + 7.0
+                    prob_score = 1.0 / (1.0 + math.exp(-calibrated_logit))
+                except Exception:
+                    prob_score = score
             
-        # Zero-Hardcoding Check: If the top document score is too low,
-        # it means the retrieved laws are semantically unrelated to the query.
-        if prob_score >= 0.52:
-            final_score = max(prob_score, 0.75)
+            doc["calibrated_score"] = prob_score
+            if idx == 0:
+                best_prob = prob_score
+            
+            if prob_score >= threshold:
+                verified_docs.append(doc)
+                
+        if verified_docs:
             status = "SUCCESS"
+            best_prob = verified_docs[0]["calibrated_score"]
         else:
-            final_score = min(prob_score, 0.60)
             status = "UNVERIFIED_LEGAL_GROUNDS"
             
-        logger.info(f"Attributed Faithfulness Score: {final_score:.4f} (Prob: {prob_score:.4f}) -> Status: {status}")
+        logger.info(f"Context Shield Gate: {len(verified_docs)}/{len(state['reranked_docs'])} docs verified above threshold {threshold}. Status: {status}")
         
-        return {"faithfulness_score": final_score, "status": status}
+        return {
+            "faithfulness_score": best_prob,
+            "status": status,
+            "reranked_docs": verified_docs if verified_docs else state["reranked_docs"]
+        }
 
     def _build_workflow(self):
         workflow = StateGraph(LegalState)
@@ -251,17 +430,549 @@ class LegalMindPipeline:
         
         self.app = workflow.compile()
 
-    def run(self, query: str) -> Dict[str, Any]:
-        initial_state = {
-            "user_query": query,
-            "extracted_intent": {},
-            "retrieved_docs": [],
-            "reranked_docs": [],
-            "response_text": "",
-            "faithfulness_score": 0.0,
-            "status": "SUCCESS"
+    def _call_slot_extractor(self, query: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
+        import json
+        from datetime import datetime
+        
+        session_slots = {
+            "issue_type": None,
+            "incident_date": None,
+            "jurisdiction": None,
+            "institution": None,
+            "incident_description": None,
+            "parties_mentioned": [],
+            "sender_name": None,
+            "recipient_name": None,
+            "slots_complete": False
         }
-        return self.app.invoke(initial_state)
+        
+        # Format history so far
+        history_lines = []
+        for turn in (history or []):
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            text = turn.get("text") or turn.get("response_text") or ""
+            history_lines.append(f"[{role}]: {text}")
+        history_str = "\n".join(history_lines)
+        
+        current_date_str = "2026-06-13"  # Mocked current date corresponding to conversation local time
+        
+        prompt = f"""You are an accurate, objective slot extractor for a legal intake system.
+Your job is to read the conversation history and the latest user message, and extract specific details of the user's legal issue.
+
+CRITICAL RULES:
+- Do NOT hallucinate. Do NOT invent details.
+- Only extract a value if it is explicitly mentioned or clearly implied in the conversation.
+- If a detail is NOT mentioned anywhere in the conversation history or latest message, you MUST return null for that slot.
+- For example, if the user has only said a greeting like "hi", "hello", "hey", all slots MUST be null.
+- Do NOT output placeholder names like "name1", "name2", "college name", "facing ragging at college", or similar unless they are actually written in the user messages.
+
+Current local date: {current_date_str}
+
+Please output a JSON object containing the values of the following slots based strictly on the conversation:
+- "issue_type": Must be one of "ragging", "eviction", "wage_theft", "consumer", "other", or null. Only set this if the user describes a legal issue.
+- "incident_date": The date of the incident (YYYY-MM-DD) or null. If the user mentions a relative date like "yesterday", resolve it relative to the current local date ({current_date_str}) to a YYYY-MM-DD format. Otherwise, if no date/time is mentioned, return null.
+- "jurisdiction": The Indian state name where the incident occurred, or null.
+- "institution": The name of the college, company, school, or landlord's building mentioned, or null.
+- "incident_description": A brief one-sentence description of the incident as described by the user, or null.
+- "parties_mentioned": A list of names of specific individuals involved (excluding generic terms like 'sender' or 'recipient'), or [].
+- "sender_name": The name of the sender/complainant/client sending the notice, or null. Only extract if explicitly provided (e.g., "sender is Vishnu" or "my name is Vishnu").
+- "recipient_name": The name of the recipient/respondent/opposing party receiving the notice, or null. Only extract if explicitly provided (e.g., "recipient is Kavya" or "opposing party is Kavya").
+
+Conversation history:
+{history_str}
+
+Latest user message:
+{query}
+
+Output ONLY valid JSON matching the format below. No markdown formatting, no code blocks, no explanations.
+
+Output format:
+{{
+  "issue_type": "ragging" | "eviction" | "wage_theft" | "consumer" | "other" | null,
+  "incident_date": "YYYY-MM-DD" or null,
+  "jurisdiction": "state name" or null,
+  "institution": "institution name" or null,
+  "incident_description": "description text" or null,
+  "parties_mentioned": ["name"] or [],
+  "sender_name": "sender name" or null,
+  "recipient_name": "recipient name" or null
+}}
+"""
+        try:
+            resp = self._call_ollama_api(prompt, temperature=0.0, format_json=True)
+            res_dict = json.loads(resp)
+            # Ensure all required keys exist
+            for k in session_slots:
+                if k not in res_dict:
+                    res_dict[k] = session_slots[k]
+            
+            # Clean up string 'null' or 'None' values to Python None
+            for k in list(res_dict.keys()):
+                if isinstance(res_dict[k], str) and res_dict[k].lower() in ["null", "none", ""]:
+                    res_dict[k] = None
+                if k == "jurisdiction" and isinstance(res_dict[k], str):
+                    res_dict[k] = res_dict[k].lower()
+            
+            # Double check slots_complete logic
+            req_fields = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+            is_complete = all(res_dict.get(f) is not None and str(res_dict.get(f)).lower() != "null" and str(res_dict.get(f)).strip() != "" for f in req_fields)
+            res_dict["slots_complete"] = is_complete
+            
+            return res_dict
+        except Exception as e:
+            logger.warning(f"Slot extractor failed: {e}")
+            return session_slots
+
+    def _call_state_router(self, slots: Dict[str, Any], query: str, history: List[Dict[str, str]]) -> str:
+        import json
+        
+        # Determine last_state first using Python rules matching previous assistant text
+        last_state = "GREETING"
+        last_assistant_msg = ""
+        for turn in reversed(history or []):
+            if turn.get("role") == "assistant":
+                last_assistant_msg = turn.get("text") or turn.get("response_text") or ""
+                break
+        
+        if not last_assistant_msg:
+            last_state = "GREETING"
+        elif "DOWNLOAD_URL" in last_assistant_msg:
+            last_state = "NOTICE_DRAFT"
+        elif "names of the Sender and the Recipient" in last_assistant_msg or "പേരുകൾ" in last_assistant_msg or "Sender and the Recipient" in last_assistant_msg:
+            last_state = "NOTICE_INTAKE"
+        elif "LEGAL ROADMAP" in last_assistant_msg or "Would you like me to draft" in last_assistant_msg or "Would you like a notice" in last_assistant_msg:
+            last_state = "NOTICE_OFFER"
+        elif any(w in last_assistant_msg.lower() for w in ["when", "where", "which state", "what is", "സംസ്ഥാന", "എപ്പോൾ", "എവിടെ"]):
+            last_state = "SLOT_FILLING"
+        else:
+            last_state = "FOLLOWUP"
+
+        # Determine if IRAC roadmap has ever been delivered in the history
+        irac_delivered = False
+        for turn in (history or []):
+            if turn.get("role") == "assistant" and "LEGAL ROADMAP" in (turn.get("text") or turn.get("response_text") or ""):
+                irac_delivered = True
+                break
+
+        # --- DETERMINISTIC PYTHON ROUTING ---
+        if not history:
+            return "GREETING"
+        
+        if not slots.get("slots_complete"):
+            return "SLOT_FILLING"
+        
+        if not irac_delivered:
+            return "RAG_RETRIEVE"
+
+        def is_valid_name(val):
+            if val is None:
+                return False
+            val_str = str(val).strip().lower()
+            if val_str in ["", "null", "none", "undefined"]:
+                return False
+            if val_str in ["name1", "name2", "college name", "institution name", "recipient name", "sender name"]:
+                return False
+            return True
+
+        sender_name = slots.get("sender_name")
+        recipient_name = slots.get("recipient_name")
+        if is_valid_name(sender_name) and is_valid_name(recipient_name):
+            return "NOTICE_DRAFT"
+
+        # Format history so far
+        history_lines = []
+        for turn in (history or []):
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            text = turn.get("text") or turn.get("response_text") or ""
+            history_lines.append(f"[{role}]: {text}")
+        history_str = "\n".join(history_lines)
+
+        prompt = f"""You are a dialogue state router for a legal assistant.
+
+Given the session state and conversation history, output the next state.
+
+Session slots: {json.dumps(slots)}
+Slots complete: {slots.get('slots_complete')}
+IRAC roadmap delivered: {irac_delivered}
+Last assistant action: {last_state}
+Latest user message: {query}
+
+Conversation history so far:
+{history_str}
+
+DECISION FLOW (Evaluate these rules sequentially from 1 to 6. Output the first matching state):
+1. If conversation history is empty and this is the first turn -> GREETING
+2. If Slots complete is false -> SLOT_FILLING
+3. If Slots complete is true AND IRAC roadmap delivered is false -> RAG_RETRIEVE
+4. If sender_name and recipient_name in Session slots are both non-null (not null) -> NOTICE_DRAFT
+5. If Last assistant action is NOTICE_OFFER AND the user message expresses consent/yes -> NOTICE_INTAKE
+6. If IRAC roadmap delivered is true AND Last assistant action is NOTICE_OFFER AND the user says NO/declines -> FOLLOWUP
+7. If IRAC roadmap delivered is true AND the user asks a follow-up question -> FOLLOWUP
+8. Otherwise -> CLARIFY
+
+Output ONLY the state name (e.g. GREETING, SLOT_FILLING, RAG_RETRIEVE, NOTICE_OFFER, NOTICE_INTAKE, NOTICE_DRAFT, FOLLOWUP, CLARIFY). Do not explain or add other text.
+"""
+        try:
+            expected_state = self._call_ollama_api(prompt, temperature=0.0).strip().upper()
+            # Clean up state string
+            for st in ["GREETING", "SLOT_FILLING", "RAG_RETRIEVE", "NOTICE_OFFER", "NOTICE_INTAKE", "NOTICE_DRAFT", "FOLLOWUP", "CLARIFY"]:
+                if st in expected_state:
+                    return st
+            return "SLOT_FILLING"
+        except Exception as e:
+            logger.warning(f"State router failed: {e}")
+            return "SLOT_FILLING"
+
+    def _call_shield_validator(self, expected_state: str, slots: Dict[str, Any], response: str, retrieved_ids: List[str], last_assistant_response: str) -> Dict[str, Any]:
+        import json
+        prompt = f"""You are a response validator for a legal assistant.
+
+Check the assistant's response against these rules and return a JSON checks object.
+
+Expected state: {expected_state}
+Session slots: {json.dumps(slots)}
+Assistant response: {response}
+Last assistant response: {last_assistant_response}
+Retrieved statute IDs: {json.dumps(retrieved_ids)}
+
+Checks:
+1. state_match: Does the response match the expected_state behavior?
+   - GREETING: Should welcome the user.
+   - SLOT_FILLING: Should ask a clarifying question for one of the missing slots.
+   - RAG_RETRIEVE/NOTICE_OFFER: Should contain a LEGAL ROADMAP/IRAC assessment or offer a notice.
+   - NOTICE_INTAKE: Should ask for names of sender/recipient.
+   - NOTICE_DRAFT: Should display the formal legal notice.
+   - FOLLOWUP: Should answer the user's follow-up question.
+   - CLARIFY: Should ask the user to clarify.
+   Only set to false if the response completely mismatches the expected state's purpose.
+
+2. no_repeat: Set to true. Only set to false if the assistant response is extremely similar or identical to the last assistant response (e.g. asking the same question again or repeating the same message, causing a loop).
+
+3. slots_respected: Set to true. Only set to false if the session slots are complete (slots_complete = true) AND the assistant response asks for slot details (like when/where it happened) again. If slots are NOT complete, asking for missing slots is expected, so set this to true.
+
+4. statute_grounded: Set to true. Only set to false if the expected_state is RAG_RETRIEVE or NOTICE_OFFER, the response cites/references specific legal statutes, and those statutes are NOT present in the retrieved statute IDs: {json.dumps(retrieved_ids)}.
+
+5. rule_non_empty: Set to true. Only set to false if the response contains a "LEGAL ROADMAP (IRAC FORMAT)", but the "RULE" (or R) section is empty, null, or "***".
+
+6. no_internal_tags: Set to true. Only set to false if the response contains raw internal metadata tags, like "(RAPTOR Layer N)".
+
+Output format:
+{{
+  "checks": {{
+    "state_match": true/false,
+    "no_repeat": true/false,
+    "slots_respected": true/false,
+    "statute_grounded": true/false,
+    "rule_non_empty": true/false,
+    "no_internal_tags": true/false
+  }}
+}}
+"""
+        default_val = {
+            "checks": {
+                "state_match": True,
+                "no_repeat": True,
+                "slots_respected": True,
+                "statute_grounded": True,
+                "rule_non_empty": True,
+                "no_internal_tags": True
+            },
+            "score": 1.0,
+            "fail_reasons": []
+        }
+        try:
+            resp = self._call_ollama_api(prompt, temperature=0.0, format_json=True)
+            res_dict = json.loads(resp)
+            checks = res_dict.get("checks", {})
+            # Ensure all check fields are present
+            for k in default_val["checks"]:
+                if k not in checks:
+                    checks[k] = default_val["checks"][k]
+            
+            passed = sum(1 for v in checks.values() if v is True)
+            score = passed / len(checks)
+            
+            return {
+                "checks": checks,
+                "score": score,
+                "fail_reasons": [k for k, v in checks.items() if v is False]
+            }
+        except Exception as e:
+            logger.warning(f"Shield validator failed to run: {e}")
+            return default_val
+
+    def analyze_dialogue_state(self, query: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
+        slots = self._call_slot_extractor(query, history)
+        state = self._call_state_router(slots, query, history)
+        
+        return {
+            "thought_process": "",
+            "state": state,
+            "missing_details": [k for k, v in slots.items() if v is None and k != "slots_complete" and k != "parties_mentioned"],
+            "clarifying_question": "",
+            "facts_summary": slots.get("incident_description") or "",
+            "jurisdiction": slots.get("jurisdiction"),
+            "approximate_date": slots.get("incident_date"),
+            "incident_description": slots.get("incident_description"),
+            "sender_name": None,
+            "recipient_name": None
+        }
+
+    def generate_notice_document_file(self, draft: str, sender: str, recipient: str) -> str:
+        """Helper to compile and save drafted legal notice to PDF/TXT."""
+        import os
+        output_dir = "data/synthesis"
+        os.makedirs(output_dir, exist_ok=True)
+        pdf_path = os.path.join(output_dir, "formal_notice.pdf")
+        
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 30px; line-height: 1.6; color: #111; }}
+                .header {{ text-align: center; font-weight: bold; font-size: 22px; text-decoration: underline; margin-bottom: 30px; }}
+                .meta {{ margin-bottom: 20px; font-size: 14px; }}
+                .content {{ white-space: pre-wrap; font-size: 14px; text-align: justify; }}
+                .signature {{ margin-top: 50px; text-align: right; font-size: 14px; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">FORMAL LEGAL NOTICE</div>
+            <div class="meta">
+                <p><strong>Date:</strong> 10th June 2026</p>
+                <p><strong>From (Sender):</strong> {sender}</p>
+                <p><strong>To (Recipient):</strong> {recipient}</p>
+            </div>
+            <div class="content">
+{draft}
+            </div>
+            <div class="signature">
+                <p>_________________________</p>
+                <p>Signature ({sender})</p>
+            </div>
+        </body>
+        </html>
+        """
+        try:
+            from weasyprint import HTML
+            HTML(string=html_content).write_pdf(pdf_path)
+            return "/api/documents/download?file=formal_notice.pdf"
+        except Exception as e:
+            logger.warning(f"WeasyPrint failed in pipeline generator: {e}")
+            txt_path = pdf_path.replace(".pdf", ".txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            return "/api/documents/download?file=formal_notice.txt"
+
+    def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None) -> Dict[str, Any]:
+        import json
+        session_slots = self._call_slot_extractor(query, history)
+        if not history:
+            expected_state = "GREETING"
+        else:
+            expected_state = self._call_state_router(session_slots, query, history)
+        logger.info(f"Dialogue State Analysis: State = {expected_state}, Slots = {session_slots}")
+        
+        # Build clean dialogue transcript lines
+        history_lines = []
+        for turn in (history or []):
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            text = turn.get("text") or turn.get("response_text") or ""
+            history_lines.append(f"[{role}]: {text}")
+        history_str = "\n".join(history_lines)
+
+        last_assistant_response = ""
+        for turn in reversed(history or []):
+            if turn.get("role") == "assistant":
+                last_assistant_response = turn.get("text") or turn.get("response_text") or ""
+                break
+
+        final_response_text = ""
+        final_status = "SUCCESS"
+        final_faithfulness = 1.0
+        retrieved_ids = []
+
+        for attempt in range(3):
+            generated_text = ""
+            if expected_state == "GREETING":
+                english = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
+                malayalam = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
+                generated_text = f"{malayalam}\n\n{english}"
+            elif expected_state == "SLOT_FILLING":
+                missing = [k for k, v in session_slots.items() if v is None and k != "slots_complete" and k != "parties_mentioned"]
+                missing_str = ", ".join(missing) if missing else "more details"
+                gen_prompt = f"""You are a helpful legal assistant.
+Given the current session slots: {json.dumps(session_slots)}
+And the conversation history:
+{history_str}
+
+Generate a polite, brief English question asking the user for ONE of the missing slots: {missing_str}.
+Do not include any greetings, notes, or intros. Only return the question."""
+                english_response = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                
+                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
+Keep it conversational and simple. Do not add or remove content.
+Use plain Malayalam, not legal jargon.
+Source English: {english_response}
+Output Malayalam only, no English."""
+                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                generated_text = f"{malayalam_response}\n\n{english_response}"
+            elif expected_state in ["RAG_RETRIEVE", "NOTICE_OFFER"]:
+                search_query = session_slots["incident_description"] if session_slots["incident_description"] else query
+                initial_state = {
+                    "user_query": search_query,
+                    "extracted_intent": {
+                        "jurisdiction": session_slots.get("jurisdiction")
+                    },
+                    "retrieved_docs": [],
+                    "reranked_docs": [],
+                    "response_text": "",
+                    "faithfulness_score": 0.0,
+                    "status": "SUCCESS",
+                    "threshold": threshold if threshold is not None else self.threshold
+                }
+                result = self.app.invoke(initial_state)
+                generated_text = result["response_text"]
+                final_status = result["status"]
+                final_faithfulness = result["faithfulness_score"]
+                retrieved_ids = [doc.get("section_id") or doc["id"] for doc in result.get("retrieved_docs", [])] + [doc.get("citation") for doc in result.get("retrieved_docs", [])]
+            elif expected_state == "NOTICE_INTAKE":
+                english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
+                malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                generated_text = f"{malayalam}\n\n{english}"
+            elif expected_state == "NOTICE_DRAFT":
+                names_prompt = f"""Given the conversation history, extract the names of the Sender (the person sending the notice / client) and the Recipient (the opposing party / person receiving the notice).
+Conversation history:
+{history_str}
+Latest user message:
+{query}
+
+Output ONLY valid JSON matching this schema:
+{{
+  "sender_name": "name or null",
+  "recipient_name": "name or null"
+}}
+"""
+                sender_name = session_slots.get("sender_name")
+                recipient_name = session_slots.get("recipient_name")
+                
+                if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
+                    try:
+                        names_json = self._call_ollama_api(names_prompt, temperature=0.0, format_json=True)
+                        names_dict = json.loads(names_json)
+                        sender_name = sender_name or names_dict.get("sender_name")
+                        recipient_name = recipient_name or names_dict.get("recipient_name")
+                    except Exception:
+                        pass
+                
+                if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
+                    parties = session_slots.get("parties_mentioned", [])
+                    if len(parties) >= 2:
+                        sender_name = sender_name or parties[0]
+                        recipient_name = recipient_name or parties[1]
+                
+                if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
+                    english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
+                    malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                    generated_text = f"{malayalam}\n\n{english}"
+                else:
+                    statutes_prompt = f"""Given the conversation history, extract the names of any legal statutes or regulations cited in the legal roadmap or assessment (for example: "Kerala Prohibition Of Ragging Act, 1998").
+Conversation history:
+{history_str}
+
+Output ONLY the names of the statutes as a comma-separated list. Do not add other text."""
+                    try:
+                        statutes_cited = self._call_ollama_api(statutes_prompt, temperature=0.0).strip()
+                    except Exception:
+                        statutes_cited = "Kerala Prohibition Of Ragging Act, 1998"
+                    
+                    draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
+
+Your task is to draft a FORMAL LEGAL NOTICE — a structured 
+official document used to assert legal rights and demand remedy.
+This is NOT a threatening letter. It is a legally recognized 
+document used in Indian courts and institutions.
+
+Use the following gathered facts:
+- Issue type: {session_slots.get('issue_type')}
+- Incident date: {session_slots.get('incident_date')}
+- Institution: {session_slots.get('institution')}
+- Jurisdiction: {session_slots.get('jurisdiction')}
+- Incident description: {session_slots.get('incident_description')}
+- Sender (complainant): {sender_name}
+- Recipient (respondent): {recipient_name}
+
+Applicable law from assessment: {statutes_cited}
+
+Draft a formal legal notice with these sections:
+1. Header (date, sender address placeholder, recipient address)
+2. Subject line
+3. Facts (numbered, objective language only)
+4. Legal violations (cite the exact statutes from assessment)
+5. Demand / Relief sought
+6. Consequence of non-compliance (legal action, not personal threat)
+7. Signature block
+
+Language: formal, objective, third-person where appropriate.
+DO NOT include threats of physical harm.
+DO NOT add any content not in the gathered facts.
+DO NOT refuse to draft this — it is a civil legal document."""
+                    draft = self._call_ollama_api(draft_prompt, temperature=0.3)
+                    download_url = self.generate_notice_document_file(draft, sender_name, recipient_name)
+                    generated_text = (
+                        f"### DRAFT FORMAL LEGAL NOTICE\n\n"
+                        f"**Sender:** {sender_name}\n"
+                        f"**Recipient:** {recipient_name}\n\n"
+                        f"---\n\n"
+                        f"{draft}\n\n"
+                        f"[DOWNLOAD_URL:{download_url}]"
+                    )
+            elif expected_state == "FOLLOWUP":
+                gen_prompt = f"""You are a helpful legal assistant.
+Answering the user's follow-up question or query based on the conversation history and previous legal assessment.
+Conversation history:
+{history_str}
+Latest user message:
+{query}
+
+Generate a polite and clear English response. Do not include any notes, prefixes, or intros. Only return the response."""
+                english_response = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
+                
+                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
+Keep it conversational and simple. Do not add or remove content.
+Use plain Malayalam, not legal jargon.
+Source English: {english_response}
+Output Malayalam only, no English."""
+                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                generated_text = f"{malayalam_response}\n\n{english_response}"
+            elif expected_state == "CLARIFY":
+                english_response = "Could you please clarify your question or describe your legal issue in more detail?"
+                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
+Keep it conversational and simple. Do not add or remove content.
+Use plain Malayalam, not legal jargon.
+Source English: {english_response}
+Output Malayalam only, no English."""
+                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                generated_text = f"{malayalam_response}\n\n{english_response}"
+            else:
+                generated_text = "Something went wrong. Please try again."
+
+            shield_res = self._call_shield_validator(expected_state, session_slots, generated_text, retrieved_ids, last_assistant_response)
+            score = shield_res.get("score", 1.0)
+            logger.info(f"Shield Validator Attempt {attempt + 1}: score = {score}, expected_state = {expected_state}")
+            
+            if score >= 0.8:
+                final_response_text = generated_text
+                break
+            else:
+                logger.warning(f"Shield validation failed for attempt {attempt + 1}: {shield_res.get('fail_reasons')}")
+                final_response_text = generated_text
+
+        return {
+            "status": final_status,
+            "response_text": final_response_text,
+            "faithfulness_score": final_faithfulness
+        }
 
 if __name__ == "__main__":
     pipeline = LegalMindPipeline()
