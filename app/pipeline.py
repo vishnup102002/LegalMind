@@ -18,6 +18,98 @@ logger = logging.getLogger("LegalMind.Pipeline")
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
+# --- CITY-TO-STATE LOOKUP (auto-resolve jurisdiction from city names) ---
+CITY_TO_STATE = {
+    # Kerala
+    "ernakulam": "kerala", "kochi": "kerala", "cochin": "kerala",
+    "trivandrum": "kerala", "thiruvananthapuram": "kerala",
+    "kozhikode": "kerala", "calicut": "kerala", "thrissur": "kerala",
+    "trichur": "kerala", "kollam": "kerala", "palakkad": "kerala",
+    "kannur": "kerala", "malappuram": "kerala", "alappuzha": "kerala",
+    "kottayam": "kerala", "idukki": "kerala", "wayanad": "kerala",
+    "pathanamthitta": "kerala", "kasaragod": "kerala",
+    # Tamil Nadu
+    "chennai": "tamil nadu", "madras": "tamil nadu", "coimbatore": "tamil nadu",
+    "madurai": "tamil nadu", "salem": "tamil nadu", "trichy": "tamil nadu",
+    "tiruchirappalli": "tamil nadu", "vellore": "tamil nadu",
+    # Karnataka
+    "bangalore": "karnataka", "bengaluru": "karnataka", "mysore": "karnataka",
+    "mysuru": "karnataka", "mangalore": "karnataka", "hubli": "karnataka",
+    # Maharashtra
+    "mumbai": "maharashtra", "bombay": "maharashtra", "pune": "maharashtra",
+    "nagpur": "maharashtra", "thane": "maharashtra", "nashik": "maharashtra",
+    # Delhi
+    "delhi": "delhi", "new delhi": "delhi",
+    # Uttar Pradesh
+    "lucknow": "uttar pradesh", "noida": "uttar pradesh", "agra": "uttar pradesh",
+    "varanasi": "uttar pradesh", "kanpur": "uttar pradesh", "ghaziabad": "uttar pradesh",
+    # Telangana
+    "hyderabad": "telangana", "secunderabad": "telangana",
+    # Andhra Pradesh
+    "visakhapatnam": "andhra pradesh", "vijayawada": "andhra pradesh",
+    "amaravati": "andhra pradesh", "vizag": "andhra pradesh",
+    # West Bengal
+    "kolkata": "west bengal", "calcutta": "west bengal",
+    # Gujarat
+    "ahmedabad": "gujarat", "surat": "gujarat", "vadodara": "gujarat",
+    # Rajasthan
+    "jaipur": "rajasthan", "jodhpur": "rajasthan", "udaipur": "rajasthan",
+    # Madhya Pradesh
+    "bhopal": "madhya pradesh", "indore": "madhya pradesh",
+    # Bihar
+    "patna": "bihar",
+    # Odisha
+    "bhubaneswar": "odisha",
+    # Punjab / Chandigarh
+    "chandigarh": "chandigarh", "amritsar": "punjab", "ludhiana": "punjab",
+    # Haryana
+    "gurgaon": "haryana", "gurugram": "haryana", "faridabad": "haryana",
+    # Goa
+    "goa": "goa", "panaji": "goa",
+    # Assam
+    "guwahati": "assam",
+    # Jharkhand
+    "ranchi": "jharkhand",
+    # Chhattisgarh
+    "raipur": "chhattisgarh",
+}
+
+# --- ISSUE-TYPE TO STATUTE HINTS (guide retrieval toward correct laws) ---
+ISSUE_TYPE_STATUTE_HINTS = {
+    "ragging": {
+        "target_laws": "UGC Regulations on Curbing Ragging 2009, state Prohibition of Ragging Act",
+        "exclude": "Do NOT search for institution-specific university acts (e.g. Azim Premji University Act, CUSAT Act). These are administrative acts, not anti-ragging laws.",
+        "queries": [
+            "UGC anti-ragging regulations punishment for ragging in educational institution India",
+            "state prohibition of ragging act punishment abetment India"
+        ]
+    },
+    "eviction": {
+        "target_laws": "State Rent Control Act, Transfer of Property Act 1882",
+        "exclude": "Do NOT search for company acts or labour laws.",
+        "queries": [
+            "Rent Control Act tenant protection against unlawful eviction India",
+            "landlord duty to provide written notice before eviction India"
+        ]
+    },
+    "wage_theft": {
+        "target_laws": "Payment of Wages Act 1936, Industrial Disputes Act 1947",
+        "exclude": "Do NOT search for Companies Act (that deals with company administration and liquidation, not individual wage claims).",
+        "queries": [
+            "Payment of Wages Act employer duty to pay wages on time India Section 5",
+            "Industrial Disputes Act worker rights remedy for non-payment of wages India"
+        ]
+    },
+    "consumer": {
+        "target_laws": "Consumer Protection Act 2019",
+        "exclude": "Do NOT search for company registration acts or SEBI regulations.",
+        "queries": [
+            "Consumer Protection Act complaint deficiency of service India",
+            "consumer dispute redressal commission filing complaint India"
+        ]
+    },
+}
+
 # Define the State definition for the LangGraph pipeline
 class LegalState(TypedDict):
     user_query: str
@@ -159,30 +251,77 @@ class LegalMindPipeline:
             logger.warning(f"LLM terminology mapping failed: {e}. Falling back to English query.")
             mapped_query = english_query
 
-        # Preserve the jurisdiction value passed from the dialogue analysis
+        # Preserve the jurisdiction and issue_type values passed from the dialogue analysis
         intent = {
             "english_query": mapped_query,
             "category": "dynamic",
             "locale": "kerala",
-            "jurisdiction": state.get("extracted_intent", {}).get("jurisdiction")
+            "jurisdiction": state.get("extracted_intent", {}).get("jurisdiction"),
+            "issue_type": state.get("extracted_intent", {}).get("issue_type")
         }
         return {"extracted_intent": intent}
 
+    def _resolve_jurisdiction_from_text(self, slots: Dict[str, Any], query: str, history: List[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Auto-resolve jurisdiction from city names mentioned in slots, query, or history."""
+        if slots.get("jurisdiction") and str(slots["jurisdiction"]).lower() not in ["null", "none", ""]:
+            return slots  # Already has a valid jurisdiction
+        
+        # Collect all text to scan for city names
+        text_pool = query.lower()
+        for field in ["institution", "incident_description"]:
+            val = slots.get(field)
+            if val:
+                text_pool += " " + str(val).lower()
+        if history:
+            for turn in history:
+                t = (turn.get("text") or turn.get("response_text") or "").lower()
+                text_pool += " " + t
+        
+        # Check each city against the text pool
+        for city, state in CITY_TO_STATE.items():
+            # Match whole word boundaries to avoid partial matches
+            import re
+            if re.search(r'\b' + re.escape(city) + r'\b', text_pool):
+                slots["jurisdiction"] = state
+                logger.info(f"Auto-resolved jurisdiction from city '{city}' → '{state}'")
+                # Re-evaluate slots_complete
+                req_fields = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+                slots["slots_complete"] = all(
+                    slots.get(f) is not None and str(slots.get(f)).lower() != "null" and str(slots.get(f)).strip() != ""
+                    for f in req_fields
+                )
+                return slots
+        
+        return slots
+
     def _expand_retrieval_queries(self, english_query: str, issue_type: str = None) -> List[str]:
-        """Generate multiple targeted legal queries to improve retrieval accuracy."""
+        """Generate multiple targeted legal queries to improve retrieval accuracy.
+        Uses issue-type-specific statute hints to guide toward correct laws."""
         import json
         queries = [english_query]  # Always include the original query
+        
+        # Add pre-computed issue-type-specific queries first (no LLM call needed)
+        hints = ISSUE_TYPE_STATUTE_HINTS.get(issue_type, {})
+        hint_queries = hints.get("queries", [])
+        for hq in hint_queries:
+            if hq not in queries:
+                queries.append(hq)
+        
+        target_laws = hints.get("target_laws", "")
+        exclude_note = hints.get("exclude", "")
         
         try:
             prompt = f"""You are a legal query expander for an Indian law retrieval system.
 
 User issue: {english_query}
 Issue type: {issue_type or 'unknown'}
+Target laws to search for: {target_laws or 'general Indian statutes'}
+{('IMPORTANT: ' + exclude_note) if exclude_note else ''}
 
 Generate 2 additional precise legal search queries to retrieve the most relevant
 statute sections. Focus on:
-1. The PRIMARY duty/obligation of the respondent (employer/landlord etc.) — e.g. "employer duty to pay wages on time India"
-2. The REMEDY or enforcement mechanism available to the complainant — e.g. "remedy for non-payment of wages labour court"
+1. The PRIMARY duty/obligation of the respondent (employer/landlord etc.)
+2. The REMEDY or enforcement mechanism available to the complainant
 
 Output ONLY valid JSON:
 {{
@@ -193,11 +332,11 @@ Output ONLY valid JSON:
             res_dict = json.loads(resp)
             for key in ["query_1", "query_2"]:
                 val = res_dict.get(key, "").strip()
-                if val and val != english_query:
+                if val and val not in queries:
                     queries.append(val)
-            logger.info(f"Expanded retrieval queries: {queries}")
+            logger.info(f"Expanded retrieval queries ({issue_type}): {queries}")
         except Exception as e:
-            logger.warning(f"Query expansion failed, using original query only: {e}")
+            logger.warning(f"Query expansion LLM call failed, using hint queries + original: {e}")
         
         return queries
 
@@ -214,7 +353,8 @@ Output ONLY valid JSON:
         jurisdiction = state["extracted_intent"].get("jurisdiction")
         
         # 1. Expand query into multiple targeted legal queries
-        expanded_queries = self._expand_retrieval_queries(english_query)
+        issue_type = state["extracted_intent"].get("issue_type")
+        expanded_queries = self._expand_retrieval_queries(english_query, issue_type=issue_type)
         
         # 2. Run hybrid search for each expanded query and merge results
         seen_ids = set()
@@ -819,6 +959,10 @@ Output format:
     def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None) -> Dict[str, Any]:
         import json
         session_slots = self._call_slot_extractor(query, history)
+        
+        # Auto-resolve jurisdiction from city names (fixes ernakulam → kerala, kochi → kerala, etc.)
+        session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)
+        
         if not history:
             expected_state = "GREETING"
         else:
@@ -874,7 +1018,8 @@ Output Malayalam only, no English."""
                 initial_state = {
                     "user_query": search_query,
                     "extracted_intent": {
-                        "jurisdiction": session_slots.get("jurisdiction")
+                        "jurisdiction": session_slots.get("jurisdiction"),
+                        "issue_type": session_slots.get("issue_type")
                     },
                     "retrieved_docs": [],
                     "reranked_docs": [],
@@ -971,7 +1116,7 @@ Draft a formal legal notice with these sections:
 1. Header (date: {notice_date}, sender address placeholder, recipient address placeholder)
 2. Subject line
 3. Facts (numbered, objective language only)
-4. Legal violations (cite the exact statutes from assessment)
+4. Legal violations — describe which laws were violated and how, citing the statute names from the assessment. DO NOT quote statute text verbatim. Instead, describe the violation in your own formal legal language.
 5. Demand / Relief sought
 6. Consequence of non-compliance (legal action, not personal threat)
 7. Signature block
@@ -980,6 +1125,7 @@ Language: formal, objective, third-person where appropriate.
 DO NOT include threats of physical harm.
 DO NOT add any content not in the gathered facts.
 DO NOT invent addresses — use [TO BE FILLED BY SENDER] for any unknown address.
+DO NOT quote or fabricate statute text verbatim — describe violations in your own words.
 DO NOT refuse to draft this — it is a civil legal document."""
                     draft = self._call_ollama_api(draft_prompt, temperature=0.3)
                     download_url = self.generate_notice_document_file(draft, sender_name, recipient_name)
