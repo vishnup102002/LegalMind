@@ -152,11 +152,46 @@ class LegalMindPipeline:
         self._build_workflow()
 
     def _call_ollama_api(self, prompt: str, temperature: float = 0.0, format_json: bool = False) -> str:
-        """Helper to invoke the local Ollama API with retries and dynamic timeout limits."""
+        """Helper to invoke the local Ollama API or optionally the cloud Groq API if configured."""
         import urllib.request
         import json
         import time
 
+        # Try Groq if GROQ_API_KEY is configured in environment
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key and groq_api_key.strip():
+            groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            groq_url = "https://api.groq.com/openai/v1/chat/completions"
+            
+            payload = {
+                "model": groq_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature
+            }
+            if format_json:
+                payload["response_format"] = {"type": "json_object"}
+                
+            for attempt, timeout in enumerate([15, 30, 45], 1):
+                try:
+                    req = urllib.request.Request(
+                        groq_url,
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers={
+                            'Content-Type': 'application/json',
+                            'Authorization': f'Bearer {groq_api_key}'
+                        },
+                        method='POST'
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        res_data = json.loads(response.read().decode('utf-8'))
+                        return res_data["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    logger.warning(f"Groq API attempt {attempt} failed: {e}")
+                    if attempt < 3:
+                        time.sleep(1)
+            logger.warning("Groq API failed completely, falling back to local Ollama.")
+
+        # Local Ollama fallback
         ollama_url = "http://localhost:11434/api/generate"
         payload = {
             "model": OLLAMA_MODEL,
@@ -263,6 +298,14 @@ class LegalMindPipeline:
 
     def _resolve_jurisdiction_from_text(self, slots: Dict[str, Any], query: str, history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """Auto-resolve jurisdiction from city names mentioned in slots, query, or history."""
+        # Normalize city names to states if slot extractor extracted a city
+        jur_val = slots.get("jurisdiction")
+        if jur_val and isinstance(jur_val, str):
+            jur_clean = jur_val.lower().strip()
+            if jur_clean in CITY_TO_STATE:
+                slots["jurisdiction"] = CITY_TO_STATE[jur_clean]
+                logger.info(f"Normalized jurisdiction from city '{jur_val}' to state '{CITY_TO_STATE[jur_clean]}'")
+
         if slots.get("jurisdiction") and str(slots["jurisdiction"]).lower() not in ["null", "none", ""]:
             return slots  # Already has a valid jurisdiction
         
@@ -458,10 +501,15 @@ Output ONLY valid JSON:
                     "You are a professional legal assistant. Analyze the user query and the retrieved legal context to create a detailed legal assessment and a layperson action guide.\n\n"
                     f"User Query: {state['user_query']}\n"
                     f"Retrieved Legal Context (Citation: {citation}):\n{text}\n\n"
+                    "CRITICAL SAFETY WARNINGS:\n"
+                    "- The 'RULE' section MUST be based strictly and directly on the provided Retrieved Legal Context.\n"
+                    "- Do NOT make up, assume, or fabricate any statutory language or sections (e.g. do not invent section text or state that a section contains a rule that is not in the text).\n"
+                    "- If the Retrieved Legal Context is just a short title/extent clause, do NOT invent details of other substantive sections that are not in the context.\n"
+                    "- If the rule is not explicitly clear or detailed in the provided context, state that clearly under RULE.\n\n"
                     "Return ONLY a JSON object matching this schema (do not include any conversational preamble, notes, or markdown formatting, just pure raw JSON):\n"
                     "{\n"
                     '  "ISSUE": "state the specific legal issue, referencing the citation",\n'
-                    '  "RULE": "state the legal rule from the retrieved context",\n'
+                    '  "RULE": "state the legal rule based strictly on the retrieved context",\n'
                     '  "APPLICATION": "apply the rule to the user\'s specific facts",\n'
                     '  "CONCLUSION": "state the legal conclusion and remedies available",\n'
                     '  "LAYPERSON": "provide simple, actionable, empathetic advice in English for a common citizen, under 3 sentences"\n'
@@ -513,22 +561,25 @@ Output ONLY valid JSON:
             has_wrong_jurisdiction = False
             user_jur = state["extracted_intent"].get("jurisdiction")
             if user_jur and user_jur.lower() != "central":
-                validation_prompt = (
-                    "You are a legal auditor. Your task is to verify if the legal roadmap matches the user's jurisdiction.\n"
-                    f"User Jurisdiction: {user_jur}\n"
-                    f"Legal Roadmap:\n{roadmap}\n\n"
-                    "Check if the roadmap cites or references any state-specific laws that do NOT belong to the user's jurisdiction. "
-                    "For example, if the user jurisdiction is 'Kerala', the roadmap must NOT reference 'Tamil Nadu Prohibition of Ragging Act' or any other state's laws. "
-                    "If there is a mismatch (e.g., citing another state's law), return only 'FAIL'. Otherwise, return 'PASS'. "
-                    "Do not include any other text."
-                )
-                try:
-                    validation_res = self._call_ollama_api(validation_prompt, temperature=0.0).strip().upper()
-                    if "FAIL" in validation_res:
-                        has_wrong_jurisdiction = True
-                        logger.warning(f"LLM validation gate failed for doc {doc_idx}: wrong jurisdiction detected. Auditor output: {validation_res}")
-                except Exception as e:
-                    logger.warning(f"LLM validation gate failed to run for doc {doc_idx}: {e}")
+                user_jur_clean = user_jur.lower().strip()
+                # Check for state-specific act citations of a different state to prevent cross-contamination.
+                all_states = [
+                    "kerala", "tamil nadu", "karnataka", "maharashtra", "delhi", 
+                    "uttar pradesh", "telangana", "andhra pradesh", "west bengal", 
+                    "gujarat", "rajasthan", "punjab", "haryana", "bihar", "goa"
+                ]
+                roadmap_lower = roadmap.lower()
+                for other_state in all_states:
+                    if other_state != user_jur_clean and other_state in roadmap_lower:
+                        if (
+                            f"{other_state} prohibition" in roadmap_lower or 
+                            f"{other_state} rent" in roadmap_lower or 
+                            f"{other_state} act" in roadmap_lower or 
+                            f"{other_state} regulations" in roadmap_lower
+                        ):
+                            has_wrong_jurisdiction = True
+                            logger.warning(f"Python validation gate: detected mismatching state '{other_state}' in roadmap for user in '{user_jur_clean}'")
+                            break
             
             if has_placeholder or has_wrong_jurisdiction:
                 logger.warning(f"Doc {doc_idx} failed validation: placeholder={has_placeholder}, wrong_jurisdiction={has_wrong_jurisdiction}")
@@ -755,13 +806,33 @@ Output format:
         sender_name = slots.get("sender_name")
         recipient_name = slots.get("recipient_name")
 
-        # Once IRAC roadmap has been delivered, NEVER loop back to SLOT_FILLING.
-        # Check NOTICE_DRAFT first (names provided), then fall through to LLM router.
+        # Once IRAC roadmap has been delivered, NEVER loop back to SLOT_FILLING or RAG_RETRIEVE.
         if irac_delivered:
             if is_valid_name(sender_name) and is_valid_name(recipient_name):
                 return "NOTICE_DRAFT"
-            # If IRAC delivered but names not yet provided, let LLM decide
-            # (NOTICE_INTAKE, NOTICE_OFFER, FOLLOWUP, etc.) — do NOT return SLOT_FILLING.
+            
+            prompt = f"""You are a dialogue state router for a legal assistant.
+The IRAC roadmap has already been delivered to the user.
+
+Latest user message: "{query}"
+Last assistant action: {last_state}
+
+Classify the user's intent into one of the following states:
+1. NOTICE_INTAKE: The user is agreeing/consenting to draft the notice, OR providing names for the draft.
+2. FOLLOWUP: The user is asking a question about the laws, the roadmap, their case, or requesting clarification.
+3. NOTICE_DRAFT: Both sender and recipient names are already provided.
+
+Output ONLY the state name (NOTICE_INTAKE, FOLLOWUP, or NOTICE_DRAFT). Do not include any other text.
+"""
+            try:
+                expected_state = self._call_ollama_api(prompt, temperature=0.0).strip().upper()
+                for st in ["NOTICE_DRAFT", "NOTICE_INTAKE", "FOLLOWUP"]:
+                    if st in expected_state:
+                        return st
+                return "FOLLOWUP"
+            except Exception as e:
+                logger.warning(f"Post-IRAC state router failed: {e}")
+                return "FOLLOWUP"
         else:
             # Before IRAC delivery, normal slot-filling flow
             if not slots.get("slots_complete"):
@@ -964,7 +1035,19 @@ Output format:
         session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)
         
         if not history:
-            expected_state = "GREETING"
+            # Check if any slot is filled (meaning user did not just say "hi")
+            has_slots_filled = any(
+                session_slots.get(k) is not None 
+                and str(session_slots.get(k)).lower() not in ["null", "none", ""]
+                for k in ["issue_type", "incident_date", "jurisdiction", "institution", "incident_description"]
+            )
+            if has_slots_filled:
+                if session_slots.get("slots_complete"):
+                    expected_state = "RAG_RETRIEVE"
+                else:
+                    expected_state = "SLOT_FILLING"
+            else:
+                expected_state = "GREETING"
         else:
             expected_state = self._call_state_router(session_slots, query, history)
         logger.info(f"Dialogue State Analysis: State = {expected_state}, Slots = {session_slots}")
