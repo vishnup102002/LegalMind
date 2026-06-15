@@ -19,6 +19,9 @@ from database.graph_store import GraphStore
 from database.vector_store import VectorStore
 from audio.stt_gateway import ShrutamAudioTranscriber
 from audio.tts_renderer import RemedialAudioGenerator
+from app.whatsapp_session import WhatsAppSessionManager
+
+session_manager = WhatsAppSessionManager()
 
 load_dotenv()
 
@@ -334,6 +337,196 @@ async def ingest_document(request: IngestRequest):
 
 
 
+
+from fastapi import Form, Request
+
+def format_for_whatsapp(text: str) -> str:
+    """Convert Markdown to WhatsApp-friendly plain text formatting"""
+    import re
+    # Replace double asterisks with single asterisks
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    # Convert subheadings to bold headers
+    text = re.sub(r'^(#+)\s+(.*?)$', r'*\2*', text, flags=re.MULTILINE)
+    # Replace markdown list dashes with bullets
+    text = re.sub(r'^\s*-\s+', '• ', text, flags=re.MULTILINE)
+    # Clean up redundant newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+def send_whatsapp_text(to: str, body: str):
+    import urllib.request
+    import urllib.parse
+    import base64
+    
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+    
+    if not account_sid or not auth_token:
+        logger.warning(f"Twilio credentials missing. Suppressed send to {to}: {body[:50]}...")
+        return
+        
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    
+    # WhatsApp message limit is 1600 characters
+    chunks = [body[i:i+1500] for i in range(0, len(body), 1500)]
+    for chunk in chunks:
+        data = {
+            "From": from_number,
+            "To": to,
+            "Body": chunk
+        }
+        encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+        auth_str = f"{account_sid}:{auth_token}"
+        auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+        
+        req = urllib.request.Request(
+            url,
+            data=encoded_data,
+            headers={
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                response.read()
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp text to {to}: {e}")
+
+def send_whatsapp_document(to: str, media_url: str, caption: str):
+    import urllib.request
+    import urllib.parse
+    import base64
+    
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+    
+    if not account_sid or not auth_token:
+        logger.warning(f"Twilio credentials missing. Suppressed document to {to}: {media_url}")
+        return
+        
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    
+    data = {
+        "From": from_number,
+        "To": to,
+        "Body": caption,
+        "MediaUrl": media_url
+    }
+    encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+    auth_str = f"{account_sid}:{auth_token}"
+    auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+    
+    req = urllib.request.Request(
+        url,
+        data=encoded_data,
+        headers={
+            "Authorization": f"Basic {auth_b64}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+    except Exception as e:
+        logger.error(f"Failed to send WhatsApp document to {to}: {e}")
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(
+    request: Request,
+    Body: str = Form(""),
+    From: str = Form(...),
+    MediaUrl0: str = Form(None),
+    NumMedia: str = Form("0")
+):
+    phone_number = From.replace("whatsapp:", "")
+    user_message = Body.strip()
+    
+    # 1. Voice note transcription support
+    try:
+        num_media_int = int(NumMedia)
+    except ValueError:
+        num_media_int = 0
+
+    if num_media_int > 0 and MediaUrl0:
+        logger.info(f"Received WhatsApp media message from {From}. Attempting voice note transcription...")
+        import urllib.request
+        import base64
+        
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        if account_sid and auth_token:
+            auth_str = f"{account_sid}:{auth_token}"
+            auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+            req = urllib.request.Request(
+                MediaUrl0,
+                headers={"Authorization": f"Basic {auth_b64}"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    audio_bytes = response.read()
+                    transcription = transcriber.transcribe(audio_bytes)
+                    logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription}'")
+                    user_message = transcription
+            except Exception as e:
+                logger.error(f"Failed to download/transcribe WhatsApp voice note: {e}")
+                user_message = "Audio transcription failed."
+        else:
+            logger.warning("Twilio credentials missing. Cannot download WhatsApp media.")
+            user_message = "Voice message received but Twilio credentials missing on server."
+
+    # 2. Reset session command check
+    if user_message.lower() in ["/reset", "reset", "clear"]:
+        session_manager.clear(phone_number)
+        reply = "നിങ്ങളുടെ ചാറ്റ് സെഷൻ റീസെറ്റ് ചെയ്തിരിക്കുന്നു.\n\nYour session has been reset. How can I help you today?"
+        send_whatsapp_text(From, reply)
+        return {"status": "ok"}
+
+    # 3. Load session history
+    session = session_manager.load(phone_number)
+    history = session.get("history", [])
+
+    # 4. Invoke the pipeline
+    result = pipeline.run(user_message, history=history)
+    response_text = result["response_text"]
+    
+    # Format message for WhatsApp
+    whatsapp_reply = format_for_whatsapp(response_text)
+
+    # 5. Extract PDF download link if present
+    download_url = None
+    pdf_match = re.search(r'\[DOWNLOAD_URL:(.*?)\]', whatsapp_reply)
+    if pdf_match:
+        raw_url = pdf_match.group(1)
+        whatsapp_reply = whatsapp_reply.replace(pdf_match.group(0), "").strip()
+        
+        public_url = os.getenv("PUBLIC_URL", "").strip()
+        if public_url:
+            download_url = f"{public_url}{raw_url}"
+        else:
+            download_url = f"http://localhost:8080{raw_url}"
+
+    # 6. Send response back to user
+    if download_url:
+        caption = "Your formal legal notice is ready. Download it using the link or view the attached document."
+        if os.getenv("PUBLIC_URL"):
+            send_whatsapp_document(From, download_url, caption)
+        else:
+            send_whatsapp_text(From, f"{caption}\n\nNotice Link: {download_url}")
+    else:
+        send_whatsapp_text(From, whatsapp_reply)
+
+    # 7. Update and save session history
+    history.append({"role": "user", "text": user_message})
+    history.append({"role": "assistant", "text": response_text})
+    session["history"] = history
+    session_manager.save(phone_number, session)
+
+    return {"status": "ok"}
 
 # Serve static files and mount index.html at root "/"
 os.makedirs("app/static", exist_ok=True)
