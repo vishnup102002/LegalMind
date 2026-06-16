@@ -185,7 +185,8 @@ class LegalMindPipeline:
                         data=json.dumps(payload).encode('utf-8'),
                         headers={
                             'Content-Type': 'application/json',
-                            'Authorization': f'Bearer {groq_api_key}'
+                            'Authorization': f'Bearer {groq_api_key}',
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
                         },
                         method='POST'
                     )
