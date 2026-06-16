@@ -8,8 +8,13 @@ logger = logging.getLogger("LegalMind.VectorStore")
 class VectorStore:
     def __init__(self, host=None, port=None):
         self.host = host or os.getenv("QDRANT_HOST", "localhost")
-        self.port = int(port or os.getenv("QDRANT_PORT", 6333))
-        self.client = QdrantClient(host=self.host, port=self.port)
+        api_key = os.getenv("QDRANT_API_KEY")
+        if self.host.startswith("http"):
+            self.client = QdrantClient(url=self.host, api_key=api_key)
+            self.port = None
+        else:
+            self.port = int(port or os.getenv("QDRANT_PORT", 6333))
+            self.client = QdrantClient(host=self.host, port=self.port, api_key=api_key)
         self.collection_name = "legal_chunks"
 
     def init_collection(self, vector_size: int = 384):
