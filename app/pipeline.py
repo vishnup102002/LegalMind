@@ -151,9 +151,12 @@ class LegalMindPipeline:
         self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=local_files_only)
         
         # 3. Load Reranker for verification
-        try:
-            self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=local_files_only)
-        except Exception as e:
+        if os.getenv("ENABLE_RERANKER", "True").lower() == "true":
+            try:
+                self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=local_files_only)
+            except Exception as e:
+                self.reranker = None
+        else:
             self.reranker = None
             
         # 4. Compile the LangGraph workflow
