@@ -1,6 +1,11 @@
 # --- PATH SETUP & DB IMPORTS ---
 import sys
 import os
+import uuid
+import urllib.request
+import urllib.parse
+import json
+import re
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,6 +22,18 @@ from transformers import pipeline
 logger = logging.getLogger("LegalMind.Pipeline")
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+# Define the State definition for the LangGraph pipeline
+class LegalState(TypedDict):
+    user_query: str
+    extracted_intent: Dict[str, Any]
+    retrieved_docs: List[Dict[str, Any]]
+    reranked_docs: List[Dict[str, Any]]
+    response_text: str
+    faithfulness_score: float
+    status: str  # SUCCESS or UNVERIFIED_LEGAL_GROUNDS
+    threshold: float
+    research_attempts: int
 
 # --- CITY-TO-STATE LOOKUP (auto-resolve jurisdiction from city names) ---
 CITY_TO_STATE = {
@@ -110,16 +127,6 @@ ISSUE_TYPE_STATUTE_HINTS = {
     },
 }
 
-# Define the State definition for the LangGraph pipeline
-class LegalState(TypedDict):
-    user_query: str
-    extracted_intent: Dict[str, Any]
-    retrieved_docs: List[Dict[str, Any]]
-    reranked_docs: List[Dict[str, Any]]
-    response_text: str
-    faithfulness_score: float
-    status: str  # SUCCESS or UNVERIFIED_LEGAL_GROUNDS
-    threshold: float
 
 class LegalMindPipeline:
     def __init__(self, threshold: float = 0.72):
@@ -588,16 +595,206 @@ Output ONLY valid JSON:
             # If we reach here, this document and generated roadmap are valid!
             return {"response_text": roadmap}
             
-        # If all docs failed validation
-        logger.warning("All retrieved docs failed validation gate.")
-        fallback_msg = (
-            "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
-            "I found a potentially relevant statute but couldn't retrieve the exact rule text. Please consult a legal aid centre."
+    def _wikipedia_search(self, query: str) -> Dict[str, str]:
+        """Search Wikipedia for a topic and retrieve clean text summary."""
+        try:
+            # 1. Search for titles
+            encoded_query = urllib.parse.quote(query)
+            search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_query}&format=json"
+            req = urllib.request.Request(search_url, headers={'User-Agent': 'LegalMind-Agent/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                results = data.get("query", {}).get("search", [])
+                if not results:
+                    return None
+                best_title = results[0]["title"]
+                
+            # 2. Get full content of the best title
+            encoded_title = urllib.parse.quote(best_title)
+            content_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext&titles={encoded_title}&format=json"
+            req = urllib.request.Request(content_url, headers={'User-Agent': 'LegalMind-Agent/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content_data = json.loads(response.read().decode('utf-8'))
+                pages = content_data.get("query", {}).get("pages", {})
+                for page_id, page_info in pages.items():
+                    if "extract" in page_info:
+                        return {
+                            "title": best_title,
+                            "text": page_info["extract"]
+                        }
+        except Exception as e:
+            logger.warning(f"Wikipedia search failed: {e}")
+        return None
+
+    def _ddg_lite_search(self, query: str) -> Dict[str, str]:
+        """Search DuckDuckGo Lite and download first organic search result's page text."""
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+                links = re.findall(r'href="(https?://[^"]+)"', html)
+                valid_links = [l for l in links if "duckduckgo.com" not in l and "ad_provider" not in l]
+                if valid_links:
+                    first_link = valid_links[0]
+                    logger.info(f"DuckDuckGo Lite search top result: {first_link}")
+                    req2 = urllib.request.Request(first_link, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req2, timeout=10) as resp2:
+                        content = resp2.read().decode('utf-8', errors='ignore')
+                        content = re.sub(r'<script[^>]*?>.*?</script>', ' ', content, flags=re.DOTALL)
+                        content = re.sub(r'<style[^>]*?>.*?</style>', ' ', content, flags=re.DOTALL)
+                        text_only = re.sub(r'<[^>]+>', ' ', content)
+                        text_only = re.sub(r'\s+', ' ', text_only).strip()
+                        return {
+                            "title": query,
+                            "text": text_only[:8000]
+                        }
+        except Exception as e:
+            logger.warning(f"DuckDuckGo Lite search failed: {e}")
+        return None
+
+    def _agentic_search(self, topic: str) -> Dict[str, str]:
+        """Runs the search fallback chain (Wikipedia -> DDG Lite)."""
+        logger.info(f"Executing web search chain for query topic: '{topic}'")
+        res = self._wikipedia_search(topic)
+        if res:
+            logger.info("✓ Wikipedia search returned content successfully.")
+            return res
+        
+        logger.info("Wikipedia returned no results or failed. Trying DuckDuckGo Lite...")
+        res = self._ddg_lite_search(topic)
+        if res:
+            logger.info("✓ DuckDuckGo Lite search returned content successfully.")
+            return res
+            
+        return None
+
+    def agentic_research_node(self, state: LegalState) -> Dict[str, Any]:
+        """Agentic Research Loop Node: perform web search, parse results, and dynamically ingest."""
+        attempts = state.get("research_attempts", 0)
+        logger.info(f"Agentic research loop node invoked. Attempt: {attempts + 1}")
+        
+        query = state.get("user_query", "")
+        prompt = (
+            "You are a legal search query formulator. Given the user's legal panic query below, "
+            "write a single simple search query designed to retrieve the relevant Indian Statute or Act. "
+            "For example, if the query is about pregnancy leave, write 'Maternity Benefit Act 1961 India'. "
+            "Only return the search terms, with no quotes, conversational preamble, or explanations:\n\n"
+            f"Query: {query}"
         )
-        return {
-            "response_text": fallback_msg,
-            "status": "UNVERIFIED_LEGAL_GROUNDS"
-        }
+        try:
+            search_query = self._call_ollama_api(prompt, temperature=0.0).replace('"', '').replace("'", "").strip()
+            logger.info(f"Formulated search term: '{search_query}'")
+        except Exception as e:
+            logger.warning(f"Failed to formulate search term with LLM: {e}. Using raw query.")
+            search_query = query
+            
+        search_res = self._agentic_search(search_query)
+        if not search_res:
+            extracted_category = state.get("extracted_intent", {}).get("issue_type")
+            if extracted_category:
+                logger.info(f"Retrying search with category: '{extracted_category}'")
+                search_res = self._agentic_search(f"{extracted_category} Act India")
+                
+        if not search_res:
+            logger.warning("No search results could be retrieved from any external sources.")
+            return {"research_attempts": attempts + 1}
+            
+        title = search_res["title"]
+        text = search_res["text"]
+        
+        sections = []
+        wiki_sections = re.findall(r'={2,}\s*([^=]+?)\s*={2,}\n(.*?)(?=\n={2,}|$)', text, re.DOTALL)
+        if wiki_sections:
+            for i, (sec_title, body) in enumerate(wiki_sections):
+                body_clean = body.strip()
+                if body_clean:
+                    sections.append({
+                        "num": str(i + 1),
+                        "title": sec_title.strip(),
+                        "body": body_clean
+                    })
+        
+        if not sections:
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+            chunk = ""
+            chunk_idx = 1
+            for p in paragraphs:
+                if len(chunk) + len(p) < 1200:
+                    chunk += "\n\n" + p
+                else:
+                    if chunk.strip():
+                        sections.append({
+                            "num": str(chunk_idx),
+                            "title": f"Paragraph {chunk_idx}",
+                            "body": chunk.strip()
+                        })
+                        chunk_idx += 1
+                    chunk = p
+            if chunk.strip():
+                sections.append({
+                    "num": str(chunk_idx),
+                    "title": f"Paragraph {chunk_idx}",
+                    "body": chunk.strip()
+                })
+                
+        if not sections:
+            logger.warning("Parsed text was empty or could not be sectioned.")
+            return {"research_attempts": attempts + 1}
+            
+        statute_id = "agentic_" + re.sub(r'[^a-zA-Z0-9]', '_', title.lower()).strip('_')
+        jurisdiction = state.get("extracted_intent", {}).get("jurisdiction") or "Central"
+        jurisdiction_clean = jurisdiction.lower().strip()
+        
+        logger.info(f"Dynamically ingesting statute '{title}' (ID: {statute_id}) to Neo4j and Qdrant...")
+        
+        try:
+            self.graph_store.add_statute(statute_id, title, jurisdiction)
+        except Exception as e:
+            logger.warning(f"Neo4j add_statute failed: {e}")
+            
+        points = []
+        for sec in sections:
+            sec_num = sec["num"]
+            sec_title = sec["title"]
+            sec_body = sec["body"]
+            section_id = f"{statute_id}_sec_{sec_num}"
+            citation = f"Section {sec_num} ({sec_title}), {title}"
+            
+            try:
+                self.graph_store.add_section(
+                    statute_id=statute_id,
+                    section_id=section_id,
+                    title=f"Section {sec_num}: {sec_title}",
+                    text=sec_body,
+                    citation=citation
+                )
+            except Exception as e:
+                logger.warning(f"Neo4j add_section failed: {e}")
+                
+            vector = self.model.encode(sec_body).tolist()
+            point_id = str(uuid.uuid4())
+            points.append({
+                "id": point_id,
+                "vector": vector,
+                "payload": {
+                    "text": sec_body,
+                    "citation": f"{citation} (Agentic RAG)",
+                    "layer_depth": 0,
+                    "section_id": section_id,
+                    "jurisdiction": jurisdiction_clean
+                }
+            })
+            
+        if points:
+            try:
+                self.vector_store.upsert_chunks(points)
+                logger.info(f"✓ Dynamic ingestion completed. Upserted {len(points)} sections.")
+            except Exception as e:
+                logger.error(f"Qdrant dynamic ingestion failed: {e}")
+                
+        return {"research_attempts": attempts + 1}
 
     def citation_shield_gate(self, state: LegalState) -> Dict[str, Any]:
         """Node 4: Validate citations dynamically using semantic threshold constraints."""
@@ -653,6 +850,7 @@ Output ONLY valid JSON:
         workflow.add_node("retrieve_context", self.retrieve_context_node)
         workflow.add_node("filter_rerank", self.filter_rerank_node)
         workflow.add_node("citation_shield", self.citation_shield_gate)
+        workflow.add_node("agentic_research", self.agentic_research_node)
         workflow.add_node("generate_roadmap", self.generate_roadmap_node)
         
         # Set Edges
@@ -660,7 +858,29 @@ Output ONLY valid JSON:
         workflow.add_edge("extract_intent", "retrieve_context")
         workflow.add_edge("retrieve_context", "filter_rerank")
         workflow.add_edge("filter_rerank", "citation_shield")
-        workflow.add_edge("citation_shield", "generate_roadmap")
+        
+        def shield_router(state: LegalState) -> str:
+            if state.get("status") == "SUCCESS":
+                return "generate_roadmap"
+            
+            # If threshold failed, see if we should try web research
+            attempts = state.get("research_attempts", 0)
+            if attempts < 1:
+                logger.info("Relevance threshold check failed. Routing to agentic_research node.")
+                return "agentic_research"
+                
+            logger.info("Relevance threshold check failed and research attempt already made. Routing to generate_roadmap fallback.")
+            return "generate_roadmap"
+            
+        workflow.add_conditional_edges(
+            "citation_shield",
+            shield_router,
+            {
+                "generate_roadmap": "generate_roadmap",
+                "agentic_research": "agentic_research"
+            }
+        )
+        workflow.add_edge("agentic_research", "retrieve_context")
         workflow.add_edge("generate_roadmap", END)
         
         self.app = workflow.compile()
@@ -1109,7 +1329,8 @@ Output Malayalam only, no English."""
                     "response_text": "",
                     "faithfulness_score": 0.0,
                     "status": "SUCCESS",
-                    "threshold": threshold if threshold is not None else self.threshold
+                    "threshold": threshold if threshold is not None else self.threshold,
+                    "research_attempts": 0
                 }
                 result = self.app.invoke(initial_state)
                 generated_text = result["response_text"]

@@ -27,19 +27,29 @@ LegalMind coordinates data orchestration across three specialized execution laye
 
 ```mermaid
 graph TD
-    Start((User Regional Voice Input)) -->|Streaming via WebRTC / FastAPI| STTNode[🗣️ STT Gateway\nShrutam-2 Conformer + MoE]
-    STTNode -->|Raw Regional Malayalam Text| IntentNode[🧠 Local Intent Extractor\nQwen-2.5-0.5B Intent Parser]
-    IntentNode -->|State Routing via LangGraph| RetrievalEngine[🔍 Hierarchical Graph Retrieval\nNeo4j GraphRAG + Qdrant BM25]
-    RetrievalEngine -->|Context Filtering| RerankNode[🎯 BGE-Reranker-Large\nSimilarity Threshold Validation]
-    RerankNode -->|Validated Context Score >= 0.72| InferenceNode[⚡ Fine-Tuned Local LLM\nLlama-3.1-8B via vLLM]
-    RerankNode -->|Context Score < 0.72| ShortCircuit[🚨 Citation Faithfulness Shield\nOutput: UNVERIFIED_LEGAL_GROUNDS]
+    Start((User Input)) -->|Text/Audio| IntentNode[🧠 Intent Extractor\nDialogue State Router]
+    IntentNode -->|Slots Incomplete| SlotFilling[📝 Slot Filling Ask]
+    IntentNode -->|Slots Complete| RetrievalEngine[🔍 Hierarchical Retrieval\nNeo4j GraphRAG + Qdrant]
+    RetrievalEngine --> RerankNode[🎯 BGE-Reranker\nSimilarity Score Calculation]
+    RerankNode --> Shield{🛡️ Citation Shield\nScore >= threshold?}
     
-    InferenceNode --> Deliverable1[📻 Deliverable 1: Remedial Roadmap Text]
-    InferenceNode --> Deliverable2[📄 Deliverable 2: Formal Legal Document]
+    Shield -->|Yes| InferenceNode[⚡ Local LLM/vLLM\nIRAC Formatting]
+    Shield -->|No| Attempts{Research Attempts < 1?}
     
-    Deliverable1 --> TTSNode[🔊 TTS Renderer: Sooktam-2] --> AudioOut((Expressive Audio Out))
-    Deliverable2 --> PrintEngine[🖨️ PDF Print Engine] --> DocumentOut((Formal Printable Document))
-
+    Attempts -->|Yes| WebResearch[🌐 Agentic Research\nWikipedia / DDG Lite Search]
+    WebResearch --> DynamicIngest[📥 Dynamic Ingest\nLoad Neo4j + Qdrant]
+    DynamicIngest --> LoopBack[Increment attempt counter]
+    LoopBack --> RetrievalEngine
+    
+    Attempts -->|No| Rejection[🚨 Shield Block\nUNVERIFIED_LEGAL_GROUNDS]
+    
+    InferenceNode --> Deliverable1[📻 layperson roadmap]
+    InferenceNode --> Deliverable2[📄 formal legal PDF notice]
+    
+    Deliverable1 --> End((Deliver to User))
+    Deliverable2 --> End
+    SlotFilling --> End
+    Rejection --> End
 ```
 
 ### Core Layer Responsibilities
@@ -100,14 +110,11 @@ sequenceDiagram
 ├── audio/
 │   ├── stt_gateway.py       # Shrutam-2 streaming transcription loop
 │   └── tts_renderer.py      # Sooktam-2 speech synthesis wrapper
-├── training/
-│   ├── sft_train.py         # Unsloth supervised fine-tuning loop script
-│   └── dpo_align.py         # Direct Preference Optimization teacher-alignment setup
 ├── app/
-│   ├── pipeline.py          # Master LangGraph multi-turn state machine configuration
-│   └── server.py            # FastAPI backend endpoints with vLLM streaming integration
+│   ├── pipeline.py          # Master LangGraph state machine with Agentic RAG fallback
+│   ├── server.py            # FastAPI backend endpoints & Twilio webhook integration
+│   └── whatsapp_session.py  # Hybrid stateful session manager (Redis/JSON file fallback)
 └── README.md
-
 ```
 
 ---
@@ -166,60 +173,28 @@ class LegalOntologyInitializer:
 if __name__ == "__main__":
     initializer = LegalOntologyInitializer("bolt://localhost:7687", ("neo4j", "secure_password_123"))
     initializer.create_constraints()
-
 ```
 
 Execute using:
 
 ```bash
 python database/graph_store.py
-
 ```
 
 ---
 
-## 🏋️ Model Fine-Tuning Specification
+## 🧠 Prompt Engineering & RAG Specification
 
-To force objective legal formatting, the supervised configuration utilizes `completion_only_loss=True` to completely mask conversational prompts, optimizing parameter weights solely on structured bracketed legal targets (**IRAC Format**: Issue, Rule, Application, Conclusion).
+Rather than relying on local model fine-tuning (which requires heavy GPU hardware), LegalMind enforces structure and tone directly through advanced **In-Context Prompt Engineering** and the **Citation Faithfulness Shield**.
 
-### Supervised Fine-Tuning Execution (Unsloth QLoRA)
+### 1. Extractive Legal Prompts (IRAC Formatting)
+The system guides base instruction models (like `Llama-3.1-8B-Instruct` or `Groq` API endpoints) by wrapping retrieved statutory text in strict system instructions. It utilizes structured JSON templates (forcing `ISSUE`, `RULE`, `APPLICATION`, `CONCLUSION`, and `LAYPERSON` structures) to prevent conversational filler and enforce precise legal formatting.
 
-```python
-# training/sft_train.py
-from unsloth import FastLanguageModel
-import torch
-from trl import SFTTrainer
-from transformers import TrainingArguments
-
-max_seq_length = 4096
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/llama-3.1-8b-instruct-bnb-4bit",
-    max_seq_length = max_seq_length,
-    load_in_4bit = True,
-)
-
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16,
-    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_alpha = 32,
-    lora_dropout = 0,
-    bias = "none",
-)
-# SFTTrainer pipeline initialization continues below...
-
-```
-
-### Alignment Dataset Sample (DPO Preference Mapping)
-
-```json
-{
-  "prompt": "GENERATE FORMAL LEGAL NOTICE SUBELEMENT. Context: Section 14 of the State Rent Control Act mandates 30 days written notice.",
-  "chosen": "LEGAL NOTICE DRAFT: Pursuant to Section 14 of the State Rent Control Act, you are hereby notified that your verbal eviction demand issued on [Date] constitutes an unlawful termination of tenancy. Under statutory law, a tenant cannot be dispossessed without a 30-day formal written notice...",
-  "rejected": "COUNSEL RESPONSE: I understand your landlord is forcing you to leave, which is very stressful. Luckily, under Section 14 of the local rent control rules, they are required to give you a 30-day notice in writing before doing this. You should present this rule to them..."
-}
-
-```
+### 2. The Verification Gate
+The pipeline implements a programmatic verification step to inspect generated roadmaps. It checks:
+- **Statute Grounding:** Ensures the LLM only cites laws retrieved by the GraphRAG and Vector retrieval layers.
+- **Zero Hallucination:** Verifies that no fictitious section numbers or placeholder text (like `***`) contaminate the output.
+- **Jurisdictional Boundary Guard:** Detects and flags cross-contamination of mismatching state laws.
 
 ---
 
@@ -250,6 +225,18 @@ if __name__ == "__main__":
     generator.text_to_indic_speech(test_roadmap)
 
 ```
+
+---
+
+## 💬 WhatsApp Integration & Webhook Interface
+
+LegalMind features a stateful, interactive WhatsApp chatbot gateway allowing marginalized users to access legal assessments and printable notice documents easily.
+
+### Webhook Specifications
+- **Endpoint:** `POST /whatsapp/webhook` (configured in Twilio Console).
+- **Session Management:** Phone-number-based caching in [whatsapp_session.py](file:///Users/vishnup/Desktop/projects/Legalmind/app/whatsapp_session.py). Automatically attempts to utilize **Redis** for stateful context tracking, falling back to a persistent JSON store (`data/whatsapp_sessions.json`) if Redis is offline.
+- **Voice Message Processing:** Incoming audio files are securely downloaded, passed to `Shrutam-2` conformer transcription locally, and processed as standard text inputs.
+- **Document Delivery:** When a formal notice is compiled, the system serves the notice as a styled PDF (`data/synthesis/formal_notice.pdf`) and pushes it directly into the WhatsApp thread as an attachment using Twilio's Media API.
 
 ---
 
