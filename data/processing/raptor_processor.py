@@ -7,7 +7,8 @@ logger = logging.getLogger("LegalMind.Processing.RAPTOR")
 
 class RaptorProcessor:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.encoder = SentenceTransformer(model_name, local_files_only=True)
+        local_files_only = os.getenv("HF_LOCAL_FILES_ONLY", "False").lower() == "true"
+        self.encoder = SentenceTransformer(model_name, local_files_only=local_files_only)
         logger.info(f"Loaded embedding encoder: {model_name}")
         
         # Test if local vLLM is available

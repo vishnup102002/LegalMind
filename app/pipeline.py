@@ -134,12 +134,13 @@ class LegalMindPipeline:
         self.graph_store = GraphStore()
         self.vector_store = VectorStore()
         
+        local_files_only = os.getenv("HF_LOCAL_FILES_ONLY", "False").lower() == "true"
         # 1. Load Universal translation model (Malayalam -> English) using Helsinki-NLP/opus-mt-ml-en
         try:
             from transformers import MarianTokenizer, MarianMTModel
             model_name = "Helsinki-NLP/opus-mt-ml-en"
-            self.translation_tokenizer = MarianTokenizer.from_pretrained(model_name, local_files_only=True)
-            self.translation_model = MarianMTModel.from_pretrained(model_name, local_files_only=True)
+            self.translation_tokenizer = MarianTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
+            self.translation_model = MarianMTModel.from_pretrained(model_name, local_files_only=local_files_only)
             self.translator = True
             logger.info("✓ Multilingual Helsinki-NLP Translation engine loaded.")
         except Exception as e:
@@ -147,11 +148,11 @@ class LegalMindPipeline:
             self.translator = None
 
         # 2. Load Embedding Encoder (operating in English semantic space)
-        self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=True)
+        self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=local_files_only)
         
         # 3. Load Reranker for verification
         try:
-            self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=True)
+            self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=local_files_only)
         except Exception as e:
             self.reranker = None
             
