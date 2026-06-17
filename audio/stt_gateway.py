@@ -49,10 +49,10 @@ class ShrutamAudioTranscriber:
                 # Convert to float32 numpy array
                 data = data.astype(np.float32)
                 
-                # 4. Transcribe using Whisper-tiny
-                result = self.pipe(data)
+                # 4. Transcribe using Whisper-tiny (forcing Malayalam language to prevent misdetection on short audio clips)
+                result = self.pipe(data, generate_kwargs={"language": "malayalam"})
                 text = result.get("text", "").strip()
-                logger.info(f"✓ Whisper-tiny transcried ASR text: '{text}'")
+                logger.info(f"✓ Whisper-tiny transcribed ASR text: '{text}'")
                 return text
             except Exception as e:
                 logger.error(f"Error during Whisper-tiny transcription: {e}")
