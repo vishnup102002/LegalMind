@@ -1303,7 +1303,22 @@ Output format:
                 malayalam = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
                 generated_text = f"{malayalam}\n\n{english}"
             elif expected_state == "SLOT_FILLING":
-                missing = [k for k, v in session_slots.items() if v is None and k != "slots_complete" and k != "parties_mentioned"]
+                # Determine if IRAC roadmap has ever been delivered in the history
+                irac_delivered = False
+                for turn in (history or []):
+                    text_content = turn.get("text") or turn.get("response_text") or ""
+                    if turn.get("role") == "assistant" and "LEGAL ROADMAP" in text_content:
+                        irac_delivered = True
+                        break
+                
+                if not irac_delivered:
+                    # Before RAG retrieval, only ask for RAG-essential slots
+                    rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+                    missing = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
+                else:
+                    # After roadmap delivery, ask for all missing slots (notice intake)
+                    missing = [k for k, v in session_slots.items() if v is None and k not in ["slots_complete", "parties_mentioned"]]
+                
                 missing_str = ", ".join(missing) if missing else "more details"
                 gen_prompt = f"""You are a helpful legal assistant.
 Given the current session slots: {json.dumps(session_slots)}
