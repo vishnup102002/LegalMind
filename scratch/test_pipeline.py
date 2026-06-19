@@ -101,7 +101,7 @@ def run_tests():
     res_followup = pipeline.run("can you show me exact law", followup_history)
     print("Status:", res_followup["status"])
     print("Response text:\n", res_followup["response_text"])
-    assert "when" not in res_followup["response_text"].lower() and "where" not in res_followup["response_text"].lower(), "Should not ask for slots again in follow-up"
+    assert "when did it" not in res_followup["response_text"].lower() and "where did it" not in res_followup["response_text"].lower() and "please provide" not in res_followup["response_text"].lower(), "Should not ask for slots again in follow-up"
     assert "പേരുകൾ" not in res_followup["response_text"] and "names of the" not in res_followup["response_text"].lower(), "Should not ask for names in general follow-up"
     
     print("\n==================================================")

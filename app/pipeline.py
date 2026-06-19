@@ -10,6 +10,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+
+class LLMUnavailableError(Exception):
+    """Raised when all LLM backends (Groq + Ollama) are unreachable."""
+    pass
+
 from database.graph_store import GraphStore
 from database.vector_store import VectorStore
 
