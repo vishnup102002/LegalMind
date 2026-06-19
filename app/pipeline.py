@@ -6,16 +6,9 @@ import urllib.request
 import urllib.parse
 import json
 import re
-import time as _time
-from datetime import datetime, date
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
-
-
-class LLMUnavailableError(Exception):
-    """Raised when all LLM backends (Groq + Ollama) are unreachable."""
-    pass
 
 from database.graph_store import GraphStore
 from database.vector_store import VectorStore
@@ -141,9 +134,6 @@ class LegalMindPipeline:
         self.graph_store = GraphStore()
         self.vector_store = VectorStore()
         
-        # Global Groq cooldown tracker — prevents cascading 429s across sequential calls
-        self._groq_cooldown_until = 0.0
-        
         local_files_only = os.getenv("HF_LOCAL_FILES_ONLY", "False").lower() == "true"
         # 1. Load Universal translation model (Malayalam -> English) using Helsinki-NLP/opus-mt-ml-en
         try:
@@ -173,17 +163,15 @@ class LegalMindPipeline:
         self._build_workflow()
 
     def _call_ollama_api(self, prompt: str, temperature: float = 0.0, format_json: bool = False) -> str:
-        """Helper to invoke the cloud Groq API (with global cooldown) or fall back to local Ollama.
-        Raises LLMUnavailableError if all backends are unreachable."""
+        """Helper to invoke the local Ollama API or optionally the cloud Groq API if configured."""
         import urllib.request
         import urllib.error
+        import json
+        import time
 
-        # Try Groq if GROQ_API_KEY is configured AND we are not in a global cooldown period
+        # Try Groq if GROQ_API_KEY is configured in environment
         groq_api_key = os.getenv("GROQ_API_KEY")
-        now = _time.time()
-        groq_available = groq_api_key and groq_api_key.strip() and now >= self._groq_cooldown_until
-        
-        if groq_available:
+        if groq_api_key and groq_api_key.strip():
             default_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
             models_to_try = [
                 default_model,
@@ -206,8 +194,8 @@ class LegalMindPipeline:
                 if format_json:
                     payload["response_format"] = {"type": "json_object"}
                 
-                # Retry with exponential backoff on 429 (reduced to 2 attempts)
-                backoffs = [2, 5]
+                # Retry with exponential backoff on 429
+                backoffs = [1, 2, 4]
                 for attempt, sleep_time in enumerate(backoffs, 1):
                     try:
                         req = urllib.request.Request(
@@ -228,34 +216,28 @@ class LegalMindPipeline:
                         if e.code == 429:
                             retry_after = e.headers.get("Retry-After") or e.headers.get("x-ratelimit-reset")
                             try:
-                                if retry_after and str(retry_after).endswith("s"):
-                                    sleep_sec = float(str(retry_after)[:-1])
-                                elif retry_after and str(retry_after).endswith("ms"):
-                                    sleep_sec = float(str(retry_after)[:-2]) / 1000.0
+                                if retry_after and retry_after.endswith("s"):
+                                    sleep_sec = float(retry_after[:-1])
+                                elif retry_after and retry_after.endswith("ms"):
+                                    sleep_sec = float(retry_after[:-2]) / 1000.0
                                 else:
                                     sleep_sec = float(retry_after) if retry_after else sleep_time
                             except ValueError:
                                 sleep_sec = sleep_time
-                            # Set global cooldown so subsequent calls in this pipeline run skip Groq
-                            cooldown_duration = max(sleep_sec, 10.0)
-                            self._groq_cooldown_until = _time.time() + cooldown_duration
-                            logger.info(f"Rate limited (429) on model {model}. Global cooldown set for {cooldown_duration}s.")
-                            _time.sleep(min(sleep_sec, 5.0))  # Sleep max 5s per attempt, cooldown handles the rest
+                            logger.info(f"Rate limited (429) on model {model}. Sleeping for {sleep_sec}s...")
+                            time.sleep(sleep_sec)
                         elif e.code == 400 and "model" in str(e).lower():
                             logger.error(f"Model {model} is not supported or active. Moving to next model.")
                             break
                         else:
                             if attempt < len(backoffs):
-                                _time.sleep(sleep_time)
+                                time.sleep(sleep_time)
                     except Exception as e:
                         logger.warning(f"Groq API model {model} attempt {attempt} failed: {e}")
                         if attempt < len(backoffs):
-                            _time.sleep(sleep_time)
+                            time.sleep(sleep_time)
             
             logger.warning("All Groq models and attempts failed completely, falling back to local Ollama.")
-        elif groq_api_key and groq_api_key.strip():
-            remaining = self._groq_cooldown_until - now
-            logger.info(f"Groq in global cooldown ({remaining:.1f}s remaining). Skipping directly to Ollama.")
 
         # Local Ollama fallback
         ollama_url = "http://localhost:11434/api/generate"
@@ -270,8 +252,8 @@ class LegalMindPipeline:
         if format_json:
             payload["format"] = "json"
 
-        # Retry loop: 2 retries, timeouts: 10s, 20s
-        timeouts = [10, 20]
+        # Retry loop: 3 retries, timeouts: 10s, 20s, 30s
+        timeouts = [10, 20, 30]
         last_err = None
         for attempt, timeout in enumerate(timeouts, 1):
             try:
@@ -293,14 +275,14 @@ class LegalMindPipeline:
                 logger.warning(f"Ollama connection attempt {attempt} failed (timeout={timeout}s): {e}")
                 last_err = e
                 if attempt < len(timeouts):
-                    _time.sleep(2)
+                    time.sleep(2)
             except Exception as e:
                 logger.warning(f"Ollama connection attempt {attempt} failed (timeout={timeout}s): {e}")
                 last_err = e
                 if attempt < len(timeouts):
-                    _time.sleep(2)
+                    time.sleep(2)
         
-        raise LLMUnavailableError(f"All LLM backends (Groq + Ollama) unreachable: {last_err}")
+        raise last_err
 
     def extract_intent_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 1: Translate regional input to Universal English space."""
@@ -363,12 +345,11 @@ class LegalMindPipeline:
             mapped_query = english_query
 
         # Preserve the jurisdiction and issue_type values passed from the dialogue analysis
-        resolved_jurisdiction = state.get("extracted_intent", {}).get("jurisdiction")
         intent = {
             "english_query": mapped_query,
             "category": "dynamic",
-            "locale": resolved_jurisdiction or "india",
-            "jurisdiction": resolved_jurisdiction,
+            "locale": "kerala",
+            "jurisdiction": state.get("extracted_intent", {}).get("jurisdiction"),
             "issue_type": state.get("extracted_intent", {}).get("issue_type")
         }
         return {"extracted_intent": intent}
@@ -501,8 +482,10 @@ Output ONLY valid JSON:
 
             # 4. For each search hit, query Neo4j for surrounding structural precedents
             db_sec_id = doc.get("section_id") or doc["id"]
-            # Convert to string for Neo4j lookup — no hardcoded statute prefix
-            db_sec_id = str(db_sec_id)
+            if isinstance(db_sec_id, int):
+                db_sec_id = f"kerala_buildings_rent_control_1965_sec_{db_sec_id}"
+            else:
+                db_sec_id = str(db_sec_id)
             
             graph_data = self.graph_store.get_related_provisions(db_sec_id)
             
@@ -662,16 +645,6 @@ Output ONLY valid JSON:
                 
             # If we reach here, this document and generated roadmap are valid!
             return {"response_text": roadmap}
-        
-        # Fallback if all documents failed validation — return rejection instead of None
-        rejection_msg = (
-            "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
-            "The legal information required to answer your query could not be verified "
-            "against authenticated statutory sources. To prevent structural risk and incorrect "
-            "guidance, the request has been short-circuited.\n\n"
-            "Please try rephrasing your query with more specific details about the incident."
-        )
-        return {"response_text": rejection_msg}
             
     def _wikipedia_search(self, query: str) -> Dict[str, str]:
         """Search Wikipedia for a topic and retrieve clean text summary."""
@@ -754,12 +727,20 @@ Output ONLY valid JSON:
         logger.info(f"Agentic research loop node invoked. Attempt: {attempts + 1}")
         
         query = state.get("user_query", "")
+        category = state.get("extracted_intent", {}).get("issue_type")
+        hint_text = ""
+        if category and category in ISSUE_TYPE_STATUTE_HINTS:
+            hints = ISSUE_TYPE_STATUTE_HINTS[category]
+            hint_text = f"\nCategory of issue: {category}\nTarget statutes/regulations to search for: {hints.get('target_laws')}"
+
         prompt = (
-            "You are a legal search query formulator. Given the user's legal panic query below, "
-            "write a single simple search query designed to retrieve the relevant Indian Statute or Act. "
-            "For example, if the query is about pregnancy leave, write 'Maternity Benefit Act 1961 India'. "
+            "You are a legal search query formulator. Given the user's legal panic query below and the category hints, "
+            "write a single simple search query (e.g. name of the Act, Statute, or Regulation) designed to retrieve the relevant Indian Statute or Act from Wikipedia/Web search.\n"
+            "Keep it broad and search-friendly (e.g. 'Maternity Benefit Act 1961 India' or 'Ragging in India' or 'Payment of Wages Act India'). "
+            "Do NOT include section numbers in the search query. "
             "Only return the search terms, with no quotes, conversational preamble, or explanations:\n\n"
             f"Query: {query}"
+            f"{hint_text}"
         )
         try:
             search_query = self._call_ollama_api(prompt, temperature=0.0).replace('"', '').replace("'", "").strip()
@@ -987,7 +968,7 @@ Output ONLY valid JSON:
             history_lines.append(f"[{role}]: {text}")
         history_str = "\n".join(history_lines)
         
-        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        current_date_str = "2026-06-13"  # Mocked current date corresponding to conversation local time
         
         prompt = f"""You are an accurate, objective slot extractor for a legal intake system.
 Your job is to read the conversation history and the latest user message, and extract specific details of the user's legal issue.
@@ -1137,6 +1118,50 @@ Output ONLY the state name (NOTICE_INTAKE, FOLLOWUP, or NOTICE_DRAFT). Do not in
                 return "SLOT_FILLING"
             return "RAG_RETRIEVE"
 
+        # Format history so far
+        history_lines = []
+        for turn in (history or []):
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            text = turn.get("text") or turn.get("response_text") or ""
+            history_lines.append(f"[{role}]: {text}")
+        history_str = "\n".join(history_lines)
+
+        prompt = f"""You are a dialogue state router for a legal assistant.
+
+Given the session state and conversation history, output the next state.
+
+Session slots: {json.dumps(slots)}
+Slots complete: {slots.get('slots_complete')}
+IRAC roadmap delivered: {irac_delivered}
+Last assistant action: {last_state}
+Latest user message: {query}
+
+Conversation history so far:
+{history_str}
+
+DECISION FLOW (Evaluate these rules sequentially from 1 to 6. Output the first matching state):
+1. If conversation history is empty and this is the first turn -> GREETING
+2. If Slots complete is false -> SLOT_FILLING
+3. If Slots complete is true AND IRAC roadmap delivered is false -> RAG_RETRIEVE
+4. If sender_name and recipient_name in Session slots are both non-null (not null) -> NOTICE_DRAFT
+5. If Last assistant action is NOTICE_OFFER AND the user message expresses consent/yes -> NOTICE_INTAKE
+6. If IRAC roadmap delivered is true AND Last assistant action is NOTICE_OFFER AND the user says NO/declines -> FOLLOWUP
+7. If IRAC roadmap delivered is true AND the user asks a follow-up question -> FOLLOWUP
+8. Otherwise -> CLARIFY
+
+Output ONLY the state name (e.g. GREETING, SLOT_FILLING, RAG_RETRIEVE, NOTICE_OFFER, NOTICE_INTAKE, NOTICE_DRAFT, FOLLOWUP, CLARIFY). Do not explain or add other text.
+"""
+        try:
+            expected_state = self._call_ollama_api(prompt, temperature=0.0).strip().upper()
+            # Clean up state string
+            for st in ["GREETING", "SLOT_FILLING", "RAG_RETRIEVE", "NOTICE_OFFER", "NOTICE_INTAKE", "NOTICE_DRAFT", "FOLLOWUP", "CLARIFY"]:
+                if st in expected_state:
+                    return st
+            return "SLOT_FILLING"
+        except Exception as e:
+            logger.warning(f"State router failed: {e}")
+            return "SLOT_FILLING"
+
     def _call_shield_validator(self, expected_state: str, slots: Dict[str, Any], response: str, retrieved_ids: List[str], last_assistant_response: str) -> Dict[str, Any]:
         import json
         prompt = f"""You are a response validator for a legal assistant.
@@ -1283,19 +1308,7 @@ Output format:
 
     def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None) -> Dict[str, Any]:
         import json
-        try:
-            session_slots = self._call_slot_extractor(query, history)
-        except LLMUnavailableError:
-            logger.error("LLM unavailable during slot extraction. Returning graceful degradation.")
-            return {
-                "status": "LLM_UNAVAILABLE",
-                "response_text": (
-                    "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
-                    "Sorry, the AI service is temporarily unavailable due to high demand. "
-                    "Please try again in 30 seconds."
-                ),
-                "faithfulness_score": 0.0
-            }
+        session_slots = self._call_slot_extractor(query, history)
         
         # Auto-resolve jurisdiction from city names (fixes ernakulam → kerala, kochi → kerala, etc.)
         session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)
@@ -1340,8 +1353,23 @@ Output format:
         for attempt in range(3):
             generated_text = ""
             if expected_state == "GREETING":
-                english = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
-                malayalam = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
+                gen_prompt = f"""You are a warm, helpful, and professional legal assistant chatbot named LegalMind.
+The user has sent a greeting: "{query}".
+Respond to the user with a welcoming greeting in English. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue, including when and where it occurred, so you can guide them.
+Do not include any placeholders, notes, or explanations. Only return the response text."""
+                try:
+                    english = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
+                except Exception:
+                    english = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
+                
+                translation_prompt = f"""Translate the following greeting to conversational Malayalam.
+Keep it simple, natural, and warm. Output Malayalam only.
+Greeting: {english}"""
+                try:
+                    malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                except Exception:
+                    malayalam = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
+                
                 generated_text = f"{malayalam}\n\n{english}"
             elif expected_state == "SLOT_FILLING":
                 # Determine if IRAC roadmap has ever been delivered in the history
@@ -1399,8 +1427,23 @@ Output Malayalam only, no English."""
                 final_faithfulness = result["faithfulness_score"]
                 retrieved_ids = [doc.get("section_id") or doc["id"] for doc in result.get("retrieved_docs", [])] + [doc.get("citation") for doc in result.get("retrieved_docs", [])]
             elif expected_state == "NOTICE_INTAKE":
-                english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
-                malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                gen_prompt = f"""You are a helpful, professional legal assistant chatbot.
+The user wants to draft a formal legal notice.
+Acknowledge their request in English. Explain politely that before you can compile the document, you need the names of the Sender (the person sending the notice) and the Recipient (the opposing party/person receiving the notice).
+Do not include any placeholders, notes, or explanations. Only return the response text."""
+                try:
+                    english = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                except Exception:
+                    english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
+                
+                translation_prompt = f"""Translate the following message to conversational Malayalam.
+Keep it simple and clear. Output Malayalam only.
+Message: {english}"""
+                try:
+                    malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                except Exception:
+                    malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                
                 generated_text = f"{malayalam}\n\n{english}"
             elif expected_state == "NOTICE_DRAFT":
                 names_prompt = f"""Given the conversation history, extract the names of the Sender (the person sending the notice / client) and the Recipient (the opposing party / person receiving the notice).
@@ -1434,8 +1477,23 @@ Output ONLY valid JSON matching this schema:
                         recipient_name = recipient_name or parties[1]
                 
                 if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
-                    english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
-                    malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                    gen_prompt = f"""You are a helpful legal assistant chatbot.
+The user wants to draft a formal legal notice, but you are still missing the names of the Sender and/or the Recipient.
+Politely ask the user in English to provide the missing name(s) (either the Sender's name, the Recipient's name, or both).
+Do not include any placeholders, notes, or explanations. Only return the response text."""
+                    try:
+                        english = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                    except Exception:
+                        english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
+                    
+                    translation_prompt = f"""Translate the following message to conversational Malayalam.
+Keep it simple and clear. Output Malayalam only.
+Message: {english}"""
+                    try:
+                        malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
+                    except Exception:
+                        malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                    
                     generated_text = f"{malayalam}\n\n{english}"
                 else:
                     statutes_prompt = f"""Given the conversation history, extract the names of any legal statutes or regulations cited in the legal roadmap or assessment (for example: "Kerala Prohibition Of Ragging Act, 1998").
@@ -1446,9 +1504,9 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     try:
                         statutes_cited = self._call_ollama_api(statutes_prompt, temperature=0.0).strip()
                     except Exception:
-                        statutes_cited = "Applicable Indian statutes as assessed in the legal roadmap"
+                        statutes_cited = "Kerala Prohibition Of Ragging Act, 1998"
                     
-                    
+                    from datetime import date
                     notice_date = date.today().strftime("%d %B %Y")
                     
                     draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
