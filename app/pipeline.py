@@ -868,6 +868,9 @@ Output ONLY valid JSON:
             return {"faithfulness_score": 0.0, "status": "UNVERIFIED_LEGAL_GROUNDS"}
             
         threshold = state.get("threshold", self.threshold)
+        if self.reranker is None:
+            # Use a lower threshold (0.55) for raw cosine similarity scores when reranker is disabled
+            threshold = 0.55
         
         # Calculate calibrated score for each document
         verified_docs = []
