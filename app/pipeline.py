@@ -473,6 +473,9 @@ Output ONLY valid JSON:
                 top_k=5,
                 jurisdiction=jurisdiction
             )
+            logger.info(f"Query '{eq[:30]}' returned {len(results)} matches.")
+            for r in results[:2]:
+                logger.info(f"   Match: {r.get('citation')}, score: {r.get('score')}, type: {r.get('type')}")
             for doc in results:
                 doc_id = doc.get("id")
                 if doc_id not in seen_ids:
