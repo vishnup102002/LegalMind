@@ -504,6 +504,7 @@ Output ONLY valid JSON:
                 "layer_depth": doc["layer_depth"],
                 "graph_precedents": graph_data.get("citing_cases", []) if graph_data else [],
                 "section_id": doc.get("section_id"),
+                "score": doc.get("score", 0.5),
             }
             retrieved_contexts.append(context_entry)
             
