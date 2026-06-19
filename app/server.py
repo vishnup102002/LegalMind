@@ -14,7 +14,7 @@ import logging
 from dotenv import load_dotenv
 
 # Import our custom services
-from app.pipeline import LegalMindPipeline
+from app.pipeline import LegalMindPipeline, LLMUnavailableError
 from database.graph_store import GraphStore
 from database.vector_store import VectorStore
 from audio.stt_gateway import ShrutamAudioTranscriber
@@ -434,6 +434,63 @@ def send_whatsapp_document(to: str, media_url: str, caption: str):
             response.read()
     except Exception as e:
         logger.error(f"Failed to send WhatsApp document to {to}: {e}")
+def send_whatsapp_audio(to: str, media_url: str, caption: str = ""):
+    """Send an audio message to WhatsApp via Twilio Media API."""
+    import urllib.request
+    import urllib.parse
+    import base64
+    
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+    
+    if not account_sid or not auth_token:
+        logger.warning(f"Twilio credentials missing. Suppressed audio send to {to}")
+        return
+        
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    
+    data = {
+        "From": from_number,
+        "To": to,
+        "MediaUrl": media_url
+    }
+    if caption:
+        data["Body"] = caption
+    
+    encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+    auth_str = f"{account_sid}:{auth_token}"
+    auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+    
+    req = urllib.request.Request(
+        url,
+        data=encoded_data,
+        headers={
+            "Authorization": f"Basic {auth_b64}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+        logger.info(f"✓ Sent WhatsApp audio message to {to}")
+    except Exception as e:
+        logger.error(f"Failed to send WhatsApp audio to {to}: {e}")
+
+def detect_text_language(text: str) -> str:
+    """Detect the primary language of text based on Unicode character analysis."""
+    if any(0x0D00 <= ord(c) <= 0x0D7F for c in text):
+        return "ml"  # Malayalam
+    elif any(0x0900 <= ord(c) <= 0x097F for c in text):
+        return "hi"  # Hindi
+    elif any(0x0B80 <= ord(c) <= 0x0BFF for c in text):
+        return "ta"  # Tamil
+    elif any(0x0C80 <= ord(c) <= 0x0CFF for c in text):
+        return "kn"  # Kannada
+    elif any(0x0C00 <= ord(c) <= 0x0C7F for c in text):
+        return "te"  # Telugu
+    return "en"
 
 @app.post("/whatsapp/webhook")
 async def whatsapp_webhook(
@@ -445,6 +502,8 @@ async def whatsapp_webhook(
 ):
     phone_number = From.replace("whatsapp:", "")
     user_message = Body.strip()
+    is_voice_input = False
+    detected_input_lang = "en"
     
     # 1. Voice note transcription support
     try:
@@ -470,8 +529,11 @@ async def whatsapp_webhook(
                 with urllib.request.urlopen(req, timeout=30) as response:
                     audio_bytes = response.read()
                     transcription = transcriber.transcribe(audio_bytes)
-                    logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription}'")
+                    # Detect input language from audio content
+                    detected_input_lang = transcriber.detect_language(audio_bytes)
+                    logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription}' (lang={detected_input_lang})")
                     user_message = transcription
+                    is_voice_input = True
             except Exception as e:
                 logger.error(f"Failed to download/transcribe WhatsApp voice note: {e}")
                 user_message = "Audio transcription failed."
@@ -490,46 +552,135 @@ async def whatsapp_webhook(
     session = session_manager.load(phone_number)
     history = session.get("history", [])
 
-    # 4. Invoke the pipeline
-    result = pipeline.run(user_message, history=history)
-    response_text = result["response_text"]
-    
-    # Format message for WhatsApp
-    whatsapp_reply = format_for_whatsapp(response_text)
-
-    # 5. Extract PDF download link if present
-    download_url = None
-    pdf_match = re.search(r'\[DOWNLOAD_URL:(.*?)\]', whatsapp_reply)
-    if pdf_match:
-        raw_url = pdf_match.group(1)
-        whatsapp_reply = whatsapp_reply.replace(pdf_match.group(0), "").strip()
+    # 4. Invoke the pipeline and manage responses safely
+    try:
+        result = pipeline.run(user_message, history=history)
+        response_text = result["response_text"]
         
-        public_url = os.getenv("PUBLIC_URL", "").strip()
-        if public_url:
-            download_url = f"{public_url}{raw_url}"
-        else:
-            download_url = f"http://localhost:8080{raw_url}"
+        # Format message for WhatsApp
+        whatsapp_reply = format_for_whatsapp(response_text)
 
-    # 6. Send response back to user
-    if download_url:
-        caption = "Your formal legal notice is ready. Download it using the link or view the attached document."
-        if os.getenv("PUBLIC_URL"):
-            send_whatsapp_document(From, download_url, caption)
-        else:
-            send_whatsapp_text(From, f"{caption}\n\nNotice Link: {download_url}")
-    else:
-        send_whatsapp_text(From, whatsapp_reply)
+        # 5. Extract PDF download link if present
+        download_url = None
+        pdf_match = re.search(r'\[DOWNLOAD_URL:(.*?)\]', whatsapp_reply)
+        if pdf_match:
+            raw_url = pdf_match.group(1)
+            whatsapp_reply = whatsapp_reply.replace(pdf_match.group(0), "").strip()
+            
+            public_url = os.getenv("PUBLIC_URL", "").strip()
+            if public_url:
+                download_url = f"{public_url}{raw_url}"
+            else:
+                download_url = f"http://localhost:8080{raw_url}"
 
-    # 7. Update and save session history
-    history.append({"role": "user", "text": user_message})
-    history.append({"role": "assistant", "text": response_text})
-    session["history"] = history
-    session_manager.save(phone_number, session)
+        # 6. Send response back to user
+        if download_url:
+            caption = "Your formal legal notice is ready. Download it using the link or view the attached document."
+            if os.getenv("PUBLIC_URL"):
+                send_whatsapp_document(From, download_url, caption)
+            else:
+                send_whatsapp_text(From, f"{caption}\n\nNotice Link: {download_url}")
+        else:
+            # Always send text reply
+            send_whatsapp_text(From, whatsapp_reply)
+        
+        # 7. Voice-to-voice: If user sent a voice note, also send back an audio reply
+        if is_voice_input and response_text:
+            try:
+                # Detect language of the response text for TTS
+                response_lang = detect_text_language(response_text)
+                # Use the input language if response is mixed or English
+                tts_lang = detected_input_lang if detected_input_lang != "en" else response_lang
+                
+                # Extract the layperson section for voice reply (most useful for illiterate users)
+                voice_text = response_text
+                if "LAYPERSON_ML:" in response_text and tts_lang == "ml":
+                    # Extract Malayalam layperson advice
+                    ml_match = re.search(r'LAYPERSON_ML:\s*(.+?)(?:\n|$)', response_text)
+                    if ml_match:
+                        voice_text = ml_match.group(1).strip()
+                elif "LAYPERSON:" in response_text:
+                    # Extract English layperson advice
+                    en_match = re.search(r'LAYPERSON:\s*(.+?)(?:\n|$)', response_text)
+                    if en_match:
+                        voice_text = en_match.group(1).strip()
+                
+                # Generate audio file
+                import tempfile
+                os.makedirs("data/tmp", exist_ok=True)
+                audio_filename = f"voice_reply_{phone_number.replace('+', '')}_{uuid.uuid4().hex[:8]}.mp3"
+                audio_path = os.path.join("data/tmp", audio_filename)
+                tts_generator.text_to_indic_speech(voice_text, audio_path)
+                
+                # Serve via public URL for Twilio to fetch
+                public_url = os.getenv("PUBLIC_URL", "").strip()
+                if public_url:
+                    # Serve the file from a static path
+                    audio_serve_url = f"{public_url}/static/voice/{audio_filename}"
+                    # Copy file to static/voice/ for serving
+                    voice_dir = os.path.join("app", "static", "voice")
+                    os.makedirs(voice_dir, exist_ok=True)
+                    import shutil
+                    shutil.copy2(audio_path, os.path.join(voice_dir, audio_filename))
+                    send_whatsapp_audio(From, audio_serve_url)
+                    logger.info(f"✓ Voice-to-voice reply sent to {From} in language '{tts_lang}'")
+                else:
+                    logger.warning("PUBLIC_URL not set. Cannot send voice reply via Twilio (requires public media URL).")
+                
+                # Clean up temp audio file
+                try:
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Voice-to-voice reply generation failed (text reply was still sent): {e}")
+
+        # 8. Update and save session history
+        history.append({"role": "user", "text": user_message})
+        history.append({"role": "assistant", "text": response_text})
+        session["history"] = history
+        session_manager.save(phone_number, session)
+        
+    except LLMUnavailableError:
+        logger.error(f"LLM backends unreachable for {From}", exc_info=True)
+        error_msg = (
+            "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
+            "Sorry, the AI service is temporarily unavailable due to high demand. "
+            "Please try again in 30 seconds."
+        )
+        send_whatsapp_text(From, error_msg)
+    except Exception as e:
+        logger.error(f"Error processing pipeline run for {From}: {e}", exc_info=True)
+        # Provide a specific error message based on the error type
+        error_str = str(e).lower()
+        if "timeout" in error_str or "timed out" in error_str:
+            error_msg = (
+                "ക്ഷമിക്കണം, സെർവർ പ്രതികരണം സമയപരിധി കഴിഞ്ഞു.\n\n"
+                "Sorry, the server response timed out. Please send your message again."
+            )
+        elif "rate" in error_str or "429" in error_str or "limit" in error_str:
+            error_msg = (
+                "ക്ഷമിക്കണം, സേവനം ഇപ്പോൾ തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
+                "Sorry, the service is currently busy. Please wait 30 seconds and try again."
+            )
+        elif "connection" in error_str or "refused" in error_str:
+            error_msg = (
+                "ക്ഷമിക്കണം, ഡാറ്റാബേസ് കണക്ഷൻ പ്രശ്നം.\n\n"
+                "Sorry, there is a database connection issue. Our team has been notified. Please try again later."
+            )
+        else:
+            error_msg = (
+                "ക്ഷമിക്കണം, ഒരു അപ്രതീക്ഷിത പിശക് സംഭവിച്ചു.\n\n"
+                "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
+            )
+        send_whatsapp_text(From, error_msg)
 
     return {"status": "ok"}
 
 # Serve static files and mount index.html at root "/"
 os.makedirs("app/static", exist_ok=True)
+os.makedirs("app/static/voice", exist_ok=True)  # Voice reply audio files served here
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 @app.get("/")

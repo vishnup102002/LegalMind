@@ -6,9 +6,16 @@ import urllib.request
 import urllib.parse
 import json
 import re
+import time as _time
+from datetime import datetime, date
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
+
+
+class LLMUnavailableError(Exception):
+    """Raised when all LLM backends (Groq + Ollama) are unreachable."""
+    pass
 
 from database.graph_store import GraphStore
 from database.vector_store import VectorStore
@@ -134,6 +141,9 @@ class LegalMindPipeline:
         self.graph_store = GraphStore()
         self.vector_store = VectorStore()
         
+        # Global Groq cooldown tracker — prevents cascading 429s across sequential calls
+        self._groq_cooldown_until = 0.0
+        
         local_files_only = os.getenv("HF_LOCAL_FILES_ONLY", "False").lower() == "true"
         # 1. Load Universal translation model (Malayalam -> English) using Helsinki-NLP/opus-mt-ml-en
         try:
@@ -163,45 +173,89 @@ class LegalMindPipeline:
         self._build_workflow()
 
     def _call_ollama_api(self, prompt: str, temperature: float = 0.0, format_json: bool = False) -> str:
-        """Helper to invoke the local Ollama API or optionally the cloud Groq API if configured."""
+        """Helper to invoke the cloud Groq API (with global cooldown) or fall back to local Ollama.
+        Raises LLMUnavailableError if all backends are unreachable."""
         import urllib.request
-        import json
-        import time
+        import urllib.error
 
-        # Try Groq if GROQ_API_KEY is configured in environment
+        # Try Groq if GROQ_API_KEY is configured AND we are not in a global cooldown period
         groq_api_key = os.getenv("GROQ_API_KEY")
-        if groq_api_key and groq_api_key.strip():
-            groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        now = _time.time()
+        groq_available = groq_api_key and groq_api_key.strip() and now >= self._groq_cooldown_until
+        
+        if groq_available:
+            default_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            models_to_try = [
+                default_model,
+                "llama-3.3-70b-versatile",
+                "llama3-8b-8192",
+                "mixtral-8x7b-32768"
+            ]
+            # Deduplicate models_to_try preserving order
+            seen = set()
+            models_to_try = [x for x in models_to_try if not (x in seen or seen.add(x))]
+            
             groq_url = "https://api.groq.com/openai/v1/chat/completions"
             
-            payload = {
-                "model": groq_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature
-            }
-            if format_json:
-                payload["response_format"] = {"type": "json_object"}
+            for model in models_to_try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature
+                }
+                if format_json:
+                    payload["response_format"] = {"type": "json_object"}
                 
-            for attempt, timeout in enumerate([15, 30, 45], 1):
-                try:
-                    req = urllib.request.Request(
-                        groq_url,
-                        data=json.dumps(payload).encode('utf-8'),
-                        headers={
-                            'Content-Type': 'application/json',
-                            'Authorization': f'Bearer {groq_api_key}',
-                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                        },
-                        method='POST'
-                    )
-                    with urllib.request.urlopen(req, timeout=timeout) as response:
-                        res_data = json.loads(response.read().decode('utf-8'))
-                        return res_data["choices"][0]["message"]["content"].strip()
-                except Exception as e:
-                    logger.warning(f"Groq API attempt {attempt} failed: {e}")
-                    if attempt < 3:
-                        time.sleep(1)
-            logger.warning("Groq API failed completely, falling back to local Ollama.")
+                # Retry with exponential backoff on 429 (reduced to 2 attempts)
+                backoffs = [2, 5]
+                for attempt, sleep_time in enumerate(backoffs, 1):
+                    try:
+                        req = urllib.request.Request(
+                            groq_url,
+                            data=json.dumps(payload).encode('utf-8'),
+                            headers={
+                                'Content-Type': 'application/json',
+                                'Authorization': f'Bearer {groq_api_key}',
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                            },
+                            method='POST'
+                        )
+                        with urllib.request.urlopen(req, timeout=20) as response:
+                            res_data = json.loads(response.read().decode('utf-8'))
+                            return res_data["choices"][0]["message"]["content"].strip()
+                    except urllib.error.HTTPError as e:
+                        logger.warning(f"Groq API model {model} attempt {attempt} failed: {e}")
+                        if e.code == 429:
+                            retry_after = e.headers.get("Retry-After") or e.headers.get("x-ratelimit-reset")
+                            try:
+                                if retry_after and str(retry_after).endswith("s"):
+                                    sleep_sec = float(str(retry_after)[:-1])
+                                elif retry_after and str(retry_after).endswith("ms"):
+                                    sleep_sec = float(str(retry_after)[:-2]) / 1000.0
+                                else:
+                                    sleep_sec = float(retry_after) if retry_after else sleep_time
+                            except ValueError:
+                                sleep_sec = sleep_time
+                            # Set global cooldown so subsequent calls in this pipeline run skip Groq
+                            cooldown_duration = max(sleep_sec, 10.0)
+                            self._groq_cooldown_until = _time.time() + cooldown_duration
+                            logger.info(f"Rate limited (429) on model {model}. Global cooldown set for {cooldown_duration}s.")
+                            _time.sleep(min(sleep_sec, 5.0))  # Sleep max 5s per attempt, cooldown handles the rest
+                        elif e.code == 400 and "model" in str(e).lower():
+                            logger.error(f"Model {model} is not supported or active. Moving to next model.")
+                            break
+                        else:
+                            if attempt < len(backoffs):
+                                _time.sleep(sleep_time)
+                    except Exception as e:
+                        logger.warning(f"Groq API model {model} attempt {attempt} failed: {e}")
+                        if attempt < len(backoffs):
+                            _time.sleep(sleep_time)
+            
+            logger.warning("All Groq models and attempts failed completely, falling back to local Ollama.")
+        elif groq_api_key and groq_api_key.strip():
+            remaining = self._groq_cooldown_until - now
+            logger.info(f"Groq in global cooldown ({remaining:.1f}s remaining). Skipping directly to Ollama.")
 
         # Local Ollama fallback
         ollama_url = "http://localhost:11434/api/generate"
@@ -216,8 +270,8 @@ class LegalMindPipeline:
         if format_json:
             payload["format"] = "json"
 
-        # Retry loop: 3 retries, timeouts: 60s, 120s, 180s
-        timeouts = [60, 120, 180]
+        # Retry loop: 2 retries, timeouts: 10s, 20s
+        timeouts = [10, 20]
         last_err = None
         for attempt, timeout in enumerate(timeouts, 1):
             try:
@@ -230,13 +284,23 @@ class LegalMindPipeline:
                 with urllib.request.urlopen(req, timeout=timeout) as response:
                     res_data = json.loads(response.read().decode('utf-8'))
                     return res_data.get("response", "").strip()
+            except urllib.error.URLError as e:
+                # Catch "Connection refused" immediately and do not loop/sleep
+                if isinstance(e.reason, ConnectionRefusedError) or "[Errno 111]" in str(e.reason) or "connection refused" in str(e.reason).lower():
+                    logger.error("Local Ollama connection refused (Ollama service not running). Aborting fallback.")
+                    last_err = e
+                    break
+                logger.warning(f"Ollama connection attempt {attempt} failed (timeout={timeout}s): {e}")
+                last_err = e
+                if attempt < len(timeouts):
+                    _time.sleep(2)
             except Exception as e:
                 logger.warning(f"Ollama connection attempt {attempt} failed (timeout={timeout}s): {e}")
                 last_err = e
                 if attempt < len(timeouts):
-                    time.sleep(2)
+                    _time.sleep(2)
         
-        raise last_err
+        raise LLMUnavailableError(f"All LLM backends (Groq + Ollama) unreachable: {last_err}")
 
     def extract_intent_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 1: Translate regional input to Universal English space."""
@@ -299,11 +363,12 @@ class LegalMindPipeline:
             mapped_query = english_query
 
         # Preserve the jurisdiction and issue_type values passed from the dialogue analysis
+        resolved_jurisdiction = state.get("extracted_intent", {}).get("jurisdiction")
         intent = {
             "english_query": mapped_query,
             "category": "dynamic",
-            "locale": "kerala",
-            "jurisdiction": state.get("extracted_intent", {}).get("jurisdiction"),
+            "locale": resolved_jurisdiction or "india",
+            "jurisdiction": resolved_jurisdiction,
             "issue_type": state.get("extracted_intent", {}).get("issue_type")
         }
         return {"extracted_intent": intent}
@@ -436,10 +501,8 @@ Output ONLY valid JSON:
 
             # 4. For each search hit, query Neo4j for surrounding structural precedents
             db_sec_id = doc.get("section_id") or doc["id"]
-            if isinstance(db_sec_id, int):
-                db_sec_id = f"kerala_buildings_rent_control_1965_sec_{db_sec_id}"
-            else:
-                db_sec_id = str(db_sec_id)
+            # Convert to string for Neo4j lookup — no hardcoded statute prefix
+            db_sec_id = str(db_sec_id)
             
             graph_data = self.graph_store.get_related_provisions(db_sec_id)
             
@@ -599,6 +662,16 @@ Output ONLY valid JSON:
                 
             # If we reach here, this document and generated roadmap are valid!
             return {"response_text": roadmap}
+        
+        # Fallback if all documents failed validation — return rejection instead of None
+        rejection_msg = (
+            "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
+            "The legal information required to answer your query could not be verified "
+            "against authenticated statutory sources. To prevent structural risk and incorrect "
+            "guidance, the request has been short-circuited.\n\n"
+            "Please try rephrasing your query with more specific details about the incident."
+        )
+        return {"response_text": rejection_msg}
             
     def _wikipedia_search(self, query: str) -> Dict[str, str]:
         """Search Wikipedia for a topic and retrieve clean text summary."""
@@ -914,7 +987,7 @@ Output ONLY valid JSON:
             history_lines.append(f"[{role}]: {text}")
         history_str = "\n".join(history_lines)
         
-        current_date_str = "2026-06-13"  # Mocked current date corresponding to conversation local time
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
         
         prompt = f"""You are an accurate, objective slot extractor for a legal intake system.
 Your job is to read the conversation history and the latest user message, and extract specific details of the user's legal issue.
@@ -1064,50 +1137,6 @@ Output ONLY the state name (NOTICE_INTAKE, FOLLOWUP, or NOTICE_DRAFT). Do not in
                 return "SLOT_FILLING"
             return "RAG_RETRIEVE"
 
-        # Format history so far
-        history_lines = []
-        for turn in (history or []):
-            role = "User" if turn.get("role") == "user" else "Assistant"
-            text = turn.get("text") or turn.get("response_text") or ""
-            history_lines.append(f"[{role}]: {text}")
-        history_str = "\n".join(history_lines)
-
-        prompt = f"""You are a dialogue state router for a legal assistant.
-
-Given the session state and conversation history, output the next state.
-
-Session slots: {json.dumps(slots)}
-Slots complete: {slots.get('slots_complete')}
-IRAC roadmap delivered: {irac_delivered}
-Last assistant action: {last_state}
-Latest user message: {query}
-
-Conversation history so far:
-{history_str}
-
-DECISION FLOW (Evaluate these rules sequentially from 1 to 6. Output the first matching state):
-1. If conversation history is empty and this is the first turn -> GREETING
-2. If Slots complete is false -> SLOT_FILLING
-3. If Slots complete is true AND IRAC roadmap delivered is false -> RAG_RETRIEVE
-4. If sender_name and recipient_name in Session slots are both non-null (not null) -> NOTICE_DRAFT
-5. If Last assistant action is NOTICE_OFFER AND the user message expresses consent/yes -> NOTICE_INTAKE
-6. If IRAC roadmap delivered is true AND Last assistant action is NOTICE_OFFER AND the user says NO/declines -> FOLLOWUP
-7. If IRAC roadmap delivered is true AND the user asks a follow-up question -> FOLLOWUP
-8. Otherwise -> CLARIFY
-
-Output ONLY the state name (e.g. GREETING, SLOT_FILLING, RAG_RETRIEVE, NOTICE_OFFER, NOTICE_INTAKE, NOTICE_DRAFT, FOLLOWUP, CLARIFY). Do not explain or add other text.
-"""
-        try:
-            expected_state = self._call_ollama_api(prompt, temperature=0.0).strip().upper()
-            # Clean up state string
-            for st in ["GREETING", "SLOT_FILLING", "RAG_RETRIEVE", "NOTICE_OFFER", "NOTICE_INTAKE", "NOTICE_DRAFT", "FOLLOWUP", "CLARIFY"]:
-                if st in expected_state:
-                    return st
-            return "SLOT_FILLING"
-        except Exception as e:
-            logger.warning(f"State router failed: {e}")
-            return "SLOT_FILLING"
-
     def _call_shield_validator(self, expected_state: str, slots: Dict[str, Any], response: str, retrieved_ids: List[str], last_assistant_response: str) -> Dict[str, Any]:
         import json
         prompt = f"""You are a response validator for a legal assistant.
@@ -1254,7 +1283,19 @@ Output format:
 
     def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None) -> Dict[str, Any]:
         import json
-        session_slots = self._call_slot_extractor(query, history)
+        try:
+            session_slots = self._call_slot_extractor(query, history)
+        except LLMUnavailableError:
+            logger.error("LLM unavailable during slot extraction. Returning graceful degradation.")
+            return {
+                "status": "LLM_UNAVAILABLE",
+                "response_text": (
+                    "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
+                    "Sorry, the AI service is temporarily unavailable due to high demand. "
+                    "Please try again in 30 seconds."
+                ),
+                "faithfulness_score": 0.0
+            }
         
         # Auto-resolve jurisdiction from city names (fixes ernakulam → kerala, kochi → kerala, etc.)
         session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)
@@ -1405,9 +1446,9 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     try:
                         statutes_cited = self._call_ollama_api(statutes_prompt, temperature=0.0).strip()
                     except Exception:
-                        statutes_cited = "Kerala Prohibition Of Ragging Act, 1998"
+                        statutes_cited = "Applicable Indian statutes as assessed in the legal roadmap"
                     
-                    from datetime import date
+                    
                     notice_date = date.today().strftime("%d %B %Y")
                     
                     draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.

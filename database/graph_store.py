@@ -8,7 +8,7 @@ class GraphStore:
     def __init__(self, uri=None, username=None, password=None):
         self.uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.username = username or os.getenv("NEO4J_USER", "neo4j")
-        self.password = password or os.getenv("NEO4J_PASSWORD", "secure_password_123")
+        self.password = password or os.getenv("NEO4J_PASSWORD", "")
         self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
 
     def close(self):
