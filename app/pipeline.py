@@ -519,19 +519,46 @@ Output ONLY valid JSON:
         if not state["retrieved_docs"]:
             return {"reranked_docs": []}
             
+        # Filter out wrong jurisdiction documents early
+        user_jur = state["extracted_intent"].get("jurisdiction")
+        filtered_docs = []
+        if user_jur and user_jur.lower() != "central":
+            user_jur_clean = user_jur.lower().strip()
+            all_states = [
+                "kerala", "tamil nadu", "karnataka", "maharashtra", "delhi", 
+                "uttar pradesh", "telangana", "andhra pradesh", "west bengal", 
+                "gujarat", "rajasthan", "punjab", "haryana", "bihar", "goa"
+            ]
+            for doc in state["retrieved_docs"]:
+                citation_lower = doc.get("citation", "").lower()
+                has_wrong_state = False
+                for state_name in all_states:
+                    if state_name != user_jur_clean:
+                        if state_name in citation_lower:
+                            has_wrong_state = True
+                            logger.info(f"Filtering out document '{doc.get('citation')}' because it belongs to wrong jurisdiction '{state_name}' (user is in '{user_jur_clean}')")
+                            break
+                if not has_wrong_state:
+                    filtered_docs.append(doc)
+        else:
+            filtered_docs = state["retrieved_docs"]
+
+        if not filtered_docs:
+            return {"reranked_docs": []}
+            
         reranked = []
         if self.reranker:
-            pairs = [(english_query, doc["text"]) for doc in state["retrieved_docs"]]
+            pairs = [(english_query, doc["text"]) for doc in filtered_docs]
             scores = self.reranker.predict(pairs, activation_fn=lambda x: x)
             
-            for idx, doc in enumerate(state["retrieved_docs"]):
+            for idx, doc in enumerate(filtered_docs):
                 doc_copy = doc.copy()
                 doc_copy["relevance_score"] = float(scores[idx])
                 reranked.append(doc_copy)
                 
             reranked.sort(key=lambda x: x["relevance_score"], reverse=True)
         else:
-            for idx, doc in enumerate(state["retrieved_docs"]):
+            for idx, doc in enumerate(filtered_docs):
                 doc_copy = doc.copy()
                 doc_copy["relevance_score"] = float(doc.get("score", 0.5))
                 reranked.append(doc_copy)
@@ -654,6 +681,15 @@ Output ONLY valid JSON:
                 
             # If we reach here, this document and generated roadmap are valid!
             return {"response_text": roadmap}
+            
+        # If we reach here, all documents failed validation!
+        rejection_msg = (
+            "STATUS: UNVERIFIED_LEGAL_GROUNDS\n"
+            "The legal information required to answer your query could not be verified "
+            "against authenticated statutory sources. To prevent structural risk and incorrect "
+            "guidance, the request has been short-circuited."
+        )
+        return {"response_text": rejection_msg, "status": "UNVERIFIED_LEGAL_GROUNDS"}
             
     def _wikipedia_search(self, query: str) -> Dict[str, str]:
         """Search Wikipedia for a topic and retrieve clean text summary."""
