@@ -34,7 +34,7 @@ class ShrutamAudioTranscriber:
     def _get_audio_hash(self, audio_bytes: bytes) -> str:
         return hashlib.md5(audio_bytes).hexdigest()
 
-    def _process_cloud_groq_asr(self, audio_bytes: bytes):
+    def _process_cloud_groq_asr(self, audio_bytes: bytes, language: str = None):
         """Invoke Groq Cloud Whisper API to transcribe and detect language."""
         groq_api_key = os.getenv("GROQ_API_KEY")
         if not groq_api_key or not groq_api_key.strip():
@@ -59,11 +59,13 @@ class ShrutamAudioTranscriber:
             "file": (filename, io.BytesIO(audio_bytes), content_type)
         }
         data = {
-            "model": "whisper-large-v3",
+            "model": "whisper-large-v3-turbo",
             "response_format": "verbose_json"
         }
+        if language:
+            data["language"] = language
 
-        logger.info(f"Uploading audio to Groq Whisper API ({content_type})...")
+        logger.info(f"Uploading audio to Groq Whisper API ({content_type}) with language hint: {language}...")
         response = requests.post(url, headers=headers, files=files, data=data, timeout=20)
         
         if response.status_code != 200:
@@ -90,7 +92,7 @@ class ShrutamAudioTranscriber:
         logger.info(f"✓ Groq Whisper API successfully transcribed: '{transcript[:60]}...' (detected language: '{lang}' from raw: '{raw_lang}')")
         return transcript, lang
 
-    def _run_asr(self, audio_bytes: bytes):
+    def _run_asr(self, audio_bytes: bytes, language: str = None):
         """Runs ASR using Groq Cloud API, falling back to local Whisper-tiny on failure."""
         audio_hash = self._get_audio_hash(audio_bytes)
         
@@ -101,7 +103,15 @@ class ShrutamAudioTranscriber:
 
         # 1. Try Groq Cloud Whisper API (Highly accurate and fast for Malayalam)
         try:
-            transcript, lang = self._process_cloud_groq_asr(audio_bytes)
+            transcript, lang = self._process_cloud_groq_asr(audio_bytes, language=language)
+            
+            # Script hallucination guard: if detected language is Malayalam but no Malayalam unicode chars are found
+            if lang == "ml" and not language:
+                has_malayalam_chars = any(0x0D00 <= ord(c) <= 0x0D7F for c in transcript)
+                if not has_malayalam_chars:
+                    logger.warning("Detected Malayalam language but transcript contains no Malayalam characters. Script hallucination suspected. Retrying with explicit language='ml'...")
+                    transcript, lang = self._process_cloud_groq_asr(audio_bytes, language="ml")
+                    
             self._last_audio_hash = audio_hash
             self._last_transcript = transcript
             self._last_language = lang
@@ -147,14 +157,14 @@ class ShrutamAudioTranscriber:
                 
         return "", "en"
 
-    def transcribe(self, audio_bytes: bytes) -> str:
+    def transcribe(self, audio_bytes: bytes, language: str = None) -> str:
         """Transcribe speech from incoming audio bytes."""
-        transcript, _ = self._run_asr(audio_bytes)
+        transcript, _ = self._run_asr(audio_bytes, language=language)
         return transcript
 
-    def detect_language(self, audio_bytes: bytes) -> str:
+    def detect_language(self, audio_bytes: bytes, language: str = None) -> str:
         """Detect language of the speech in incoming audio bytes."""
-        _, lang = self._run_asr(audio_bytes)
+        _, lang = self._run_asr(audio_bytes, language=language)
         return lang
 
     def transcribe_stream(self, audio_generator):

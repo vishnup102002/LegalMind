@@ -530,6 +530,9 @@ async def whatsapp_webhook(
     NumMedia: str = Form("0")
 ):
     phone_number = From.replace("whatsapp:", "")
+    session = session_manager.load(phone_number)
+    session_lang = session.get("lang")
+    
     user_message = Body.strip()
     is_voice_input = False
     detected_input_lang = "en"
@@ -546,9 +549,9 @@ async def whatsapp_webhook(
         num_media_int = int(NumMedia)
     except ValueError:
         num_media_int = 0
-
+ 
     if num_media_int > 0 and MediaUrl0:
-        logger.info(f"Received WhatsApp media message from {From}. Attempting voice note transcription...")
+        logger.info(f"Received WhatsApp media message from {From}. Attempting voice note transcription with hint: {session_lang}...")
         import urllib.request
         import base64
         
@@ -564,9 +567,9 @@ async def whatsapp_webhook(
             try:
                 with urllib.request.urlopen(req, timeout=30) as response:
                     audio_bytes = response.read()
-                    transcription = transcriber.transcribe(audio_bytes)
+                    transcription = transcriber.transcribe(audio_bytes, language=session_lang)
                     # Detect input language from audio content
-                    detected_input_lang = transcriber.detect_language(audio_bytes)
+                    detected_input_lang = transcriber.detect_language(audio_bytes, language=session_lang)
                     logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription}' (lang={detected_input_lang})")
                     user_message = transcription
                     is_voice_input = True
@@ -576,16 +579,15 @@ async def whatsapp_webhook(
         else:
             logger.warning("Twilio credentials missing. Cannot download WhatsApp media.")
             user_message = "Voice message received but Twilio credentials missing on server."
-
+ 
     # 2. Reset session command check
     if user_message.lower() in ["/reset", "reset", "clear"]:
         session_manager.clear(phone_number)
         reply = "നിങ്ങളുടെ ചാറ്റ് സെഷൻ റീസെറ്റ് ചെയ്തിരിക്കുന്നു.\n\nYour session has been reset. How can I help you today?"
         send_whatsapp_text(From, reply)
         return {"status": "ok"}
-
-    # 3. Load session history
-    session = session_manager.load(phone_number)
+ 
+    # 3. Load session history (session loaded early at start)
     
     # Bug 1 Fix: Set language on session start and stick to it
     if "lang" not in session:
