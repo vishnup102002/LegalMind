@@ -110,13 +110,16 @@ sequenceDiagram
 │   ├── stt_gateway.py       # Shrutam-2 streaming transcription loop
 │   └── tts_renderer.py      # Sooktam-2 speech synthesis wrapper
 ├── app/
+│   ├── evaluator.py         # LLM-as-a-Judge evaluation framework
 │   ├── pipeline.py          # Master LangGraph state machine with Agentic RAG fallback
 │   ├── server.py            # FastAPI backend endpoints & Twilio webhook integration
 │   └── whatsapp_session.py  # Hybrid stateful session manager (Redis/JSON file fallback)
 ├── scripts/
+│   ├── run_evaluation.py    # Automated evaluation harness for quality metrics
 │   ├── setup_ec2.sh         # Automated environment configuration script for AWS EC2
 │   ├── test_cloud_credentials.py # Cloud database & LLM connectivity checker
 │   └── ingest_xml_statutes.py # Ingestion pipeline parser for Indian Statutes
+├── evaluation_report.md     # Auto-generated quality evaluation results
 └── README.md
 ```
 
@@ -181,11 +184,31 @@ LegalMind enforces structure and tone directly through advanced **In-Context Pro
 ### 1. Extractive Legal Prompts (IRAC Formatting)
 The system guides base instruction models (like `Llama-3.1-8B-Instruct` or `Groq` API endpoints) by wrapping retrieved statutory text in strict system instructions. It utilizes structured JSON templates (forcing `ISSUE`, `RULE`, `APPLICATION`, `CONCLUSION`, and `LAYPERSON` structures) to prevent conversational filler and enforce precise legal formatting.
 
-### 2. The Verification Gate
+### 2. Malayalam Translation & Phrasing Optimization
+To guarantee natural dialect responses, the pipeline avoids hardcoded string replacements. Instead, it utilizes **few-shot prompt examples** within the `SLOT_FILLING` agent block. This guides the generator to output polite and native Malayalam dialog (e.g. *"കുറ്റകൃത്യം/സംഭവം നടന്ന തീയതി പറയാമോ?"* instead of robotic literal translations).
+
+### 3. The Verification Gate
 The pipeline implements a programmatic verification step to inspect generated roadmaps. It checks:
 - **Statute Grounding**: Ensures the LLM only cites laws retrieved by the GraphRAG and Vector retrieval layers.
 - **Zero Hallucination**: Verifies that no fictitious section numbers or placeholder text (like `***`) contaminate the output.
 - **Jurisdictional Boundary Guard**: Detects and flags cross-contamination of mismatching state laws.
+- **Regional Script Normalization**: Resolves dialect spelling variations (e.g., mapping *"എറണാകുളം"* and *"കൊച്ചി"* to English slots like *"Ernakulam"* and *"Kochi"*) prior to structural analysis to avoid slot-filling loops.
+
+---
+
+## 📊 Quality Auditing & LLM-as-a-Judge
+
+To verify reliability, accuracy, and safety, the project integrates an automated LLM-as-a-Judge evaluation suite (`scripts/run_evaluation.py`). 
+
+The harness executes 12 multi-lingual scenarios (English & Malayalam) across Ragging, Eviction, Wage Theft, Consumer Complaints, Greetings, and Clarifications. Each response is graded dynamically by the LLM-as-a-Judge (`app/evaluator.py`) across five metrics:
+
+- **Faithfulness (Threshold: >= 0.70)**: Verifies that the response relies strictly and exclusively on the retrieved legal context.
+- **Relevance (Threshold: >= 0.80)**: Checks if the response directly addresses the user's specific query.
+- **Language Compliance (Threshold: >= 0.90)**: Enforces zero language mixing (maintaining strict Malayalam-only or English-only turns).
+- **Hallucination Rate (Threshold: <= 0.10)**: Validates that the model does not invent fictitious sections, acts, or rules.
+- **Completeness (Threshold: >= 0.80)**: Enforces that generated legal assessments contain the full IRAC block andLayperson instructions.
+
+All metrics are verified locally, outputting a Markdown evaluation summary (`evaluation_report.md`) on completion.
 
 ---
 
@@ -195,9 +218,9 @@ LegalMind features a stateful, interactive WhatsApp chatbot gateway allowing mar
 
 ### Webhook Specifications
 - **Endpoint**: `POST /whatsapp/webhook` (configured in Twilio Console).
-- **Session Management**: Phone-number-based caching in [whatsapp_session.py](file:///Users/vishnup/Desktop/projects/Legalmind/app/whatsapp_session.py). Automatically attempts to utilize **Redis** for stateful context tracking, falling back to a persistent local JSON store (`data/whatsapp_sessions.json`) if Redis is offline.
-- **Voice Message Processing**: Incoming audio files are securely downloaded, passed to `Shrutam-2` conformer transcription locally (or falls back to cloud ASR), and processed as standard text inputs.
-- **Document Delivery**: When a formal notice is compiled, the system serves the notice as a styled PDF (`data/synthesis/formal_notice.pdf`) and pushes it directly into the WhatsApp thread as an attachment using Twilio's Media API.
+- **Session Management**: Phone-number-based caching in [whatsapp_session.py](file:///Users/vishnup/Desktop/projects/Legalmind/app/whatsapp_session.py). Dynamically tracks locked language preferences (`session["lang"]`) and user modality (`session["modality"]`).
+- **Voice Message Processing & TTS**: Incoming audio files are transcribed. If `session["modality"] == "voice"`, the bot synthesizes the layperson roadmap response into high-fidelity speech and plays it back as a voice note attachment on every subsequent turn.
+- **Document Delivery**: Notice drafts are compiled into a styled PDF (`data/synthesis/formal_notice.pdf`) and pushed directly into the WhatsApp thread as an attachment using Twilio's Media API.
 
 ### 📲 How to Use & Test (Twilio Free Sandbox)
 Because the development and trial phases run under a **Twilio Free Trial Sandbox**, users must first register their numbers with the sandbox before they can receive chatbot replies:
@@ -212,6 +235,8 @@ Because the development and trial phases run under a **Twilio Free Trial Sandbox
 
 * [x] **Agentic RAG Fallback Loop** — Loop RAG checks to scrape and ingest Wikipedia/Web statutes dynamically if offline queries fail shield checks.
 * [x] **Stateful WhatsApp Gateway** — Webhook integrations with automatic audio transcription and PDF attachments.
+* [x] **Bidirectional Voice-to-Voice Modality** — Lock conversation modality to voice, serving TTS audio roadmaps dynamically on all turns.
+* [x] **LLM-as-a-Judge Evaluation Suite** — Quality metric auditing for Faithfulness, Relevance, Language Compliance, Hallucination, and Completeness.
 * [ ] **Dynamic Cross-Lingual Code-Switching** — Upgrade STT pipelines to handle mixed Manglish (Malayalam + English) input smoothly.
 * [ ] **Hardware-Accelerated Edge Voice Deployments** — Package the transcription and intent-extraction engines into standalone edge hardware devices.
 
@@ -220,3 +245,4 @@ Because the development and trial phases run under a **Twilio Free Trial Sandbox
 ## 📜 License
 
 Licensed under the [MIT License](https://www.google.com/search?q=LICENSE). Created by **Vishnu P**.
+

@@ -341,8 +341,37 @@ async def ingest_document(request: IngestRequest):
 from fastapi import Form, Request
 
 def format_for_whatsapp(text: str) -> str:
-    """Convert Markdown to WhatsApp-friendly plain text formatting"""
+    """Convert Markdown to WhatsApp-friendly plain text formatting, and strip technical IRAC details."""
     import re
+    
+    # 1. Clean and simplify legal roadmap responses to hide raw IRAC details on WhatsApp
+    if "LEGAL ROADMAP (IRAC FORMAT):" in text:
+        # Extract the supportive preamble (everything before the IRAC header)
+        preamble = text.split("LEGAL ROADMAP (IRAC FORMAT):")[0].strip()
+        
+        # Extract the layperson section using regex
+        layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n\n|\n*$)', text, re.IGNORECASE)
+        layperson_text = layperson_match.group(1).strip() if layperson_match else ""
+        
+        # Extract the offer to draft a notice (trailing question at the end)
+        offer_match = re.search(r'(Would you like me to draft a formal legal notice based on this assessment\?|ഈ വിലയിരുത്തലിന്റെ അടിസ്ഥാനത്തിൽ ഒരു ഔദ്യോഗിക നിയമ നോട്ടീസ് തയ്യാറാക്കാൻ നിങ്ങൾക്ക് താല്പര്യമുണ്ടോ\?)', text, re.IGNORECASE)
+        offer_text = offer_match.group(1).strip() if offer_match else ""
+        
+        # Detect language of the query response
+        is_ml = any(0x0D00 <= ord(c) <= 0x0D7F for c in text)
+        guide_label = "*ലളിതമായ നിർദ്ദേശം (Action Guide):*" if is_ml else "*Citizen Action Guide:*"
+        
+        parts = []
+        if preamble:
+            parts.append(preamble)
+        if layperson_text:
+            parts.append(f"{guide_label}\n{layperson_text}")
+        if offer_text:
+            parts.append(offer_text)
+            
+        text = "\n\n".join(parts)
+        
+    # Standard Markdown to WhatsApp text conversion
     # Replace double asterisks with single asterisks
     text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
     # Convert subheadings to bold headers
@@ -505,6 +534,13 @@ async def whatsapp_webhook(
     is_voice_input = False
     detected_input_lang = "en"
     
+    # Detect language from text input (Unicode analysis)
+    if user_message and not is_voice_input:
+        if any(0x0D00 <= ord(c) <= 0x0D7F for c in user_message):
+            detected_input_lang = "ml"
+        else:
+            detected_input_lang = "en"
+    
     # 1. Voice note transcription support
     try:
         num_media_int = int(NumMedia)
@@ -550,11 +586,22 @@ async def whatsapp_webhook(
 
     # 3. Load session history
     session = session_manager.load(phone_number)
+    
+    # Bug 1 Fix: Set language on session start and stick to it
+    if "lang" not in session:
+        session["lang"] = detected_input_lang
+        
+    # Bug 3 Fix: Track user modality and stick to it
+    if is_voice_input:
+        session["modality"] = "voice"
+    elif "modality" not in session:
+        session["modality"] = "text"
+        
     history = session.get("history", [])
 
     # 4. Invoke the pipeline and manage responses safely
     try:
-        result = pipeline.run(user_message, history=history)
+        result = pipeline.run(user_message, history=history, language=session.get("lang"))
         response_text = result["response_text"]
         
         # Format message for WhatsApp
@@ -573,37 +620,28 @@ async def whatsapp_webhook(
             else:
                 download_url = f"http://localhost:8080{raw_url}"
 
-        # 6. Send response back to user
-        if download_url:
-            caption = "Your formal legal notice is ready. Download it using the link or view the attached document."
-            if os.getenv("PUBLIC_URL"):
-                send_whatsapp_document(From, download_url, caption)
-            else:
-                send_whatsapp_text(From, f"{caption}\n\nNotice Link: {download_url}")
-        else:
-            # Always send text reply
-            send_whatsapp_text(From, whatsapp_reply)
+        # 6. ALWAYS send text reply FIRST (Twilio sandbox drops document-only messages)
+        send_whatsapp_text(From, whatsapp_reply)
         
-        # 7. Voice-to-voice: If user sent a voice note, also send back an audio reply
-        if is_voice_input and response_text:
+        # 7. Then try sending document as bonus attachment
+        if download_url:
             try:
-                # Detect language of the response text for TTS
-                response_lang = detect_text_language(response_text)
-                # Use the input language if response is mixed or English
-                tts_lang = detected_input_lang if detected_input_lang != "en" else response_lang
+                caption = "📄 Formal Legal Notice (download)"
+                send_whatsapp_document(From, download_url, caption)
+            except Exception as doc_err:
+                logger.warning(f"Document send failed (text was already sent): {doc_err}")
+        
+        # 7. Voice-to-voice: If user modality is voice, also send back an audio reply
+        if session.get("modality") == "voice" and response_text:
+            try:
+                # Use the session's locked language
+                tts_lang = session.get("lang", "en")
                 
                 # Extract the layperson section for voice reply (most useful for illiterate users)
                 voice_text = response_text
-                if "LAYPERSON_ML:" in response_text and tts_lang == "ml":
-                    # Extract Malayalam layperson advice
-                    ml_match = re.search(r'LAYPERSON_ML:\s*(.+?)(?:\n|$)', response_text)
-                    if ml_match:
-                        voice_text = ml_match.group(1).strip()
-                elif "LAYPERSON:" in response_text:
-                    # Extract English layperson advice
-                    en_match = re.search(r'LAYPERSON:\s*(.+?)(?:\n|$)', response_text)
-                    if en_match:
-                        voice_text = en_match.group(1).strip()
+                layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', response_text, re.IGNORECASE)
+                if layperson_match:
+                    voice_text = layperson_match.group(1).strip()
                 
                 # Generate audio file
                 import tempfile

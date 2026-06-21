@@ -969,7 +969,57 @@
                         const laypersonMLText = laypersonMLMatch ? laypersonMLMatch[1].trim() : "";
 
                         let laypersonHtml = '';
-                        if (laypersonText && laypersonMLText) {
+                        if (laypersonText || laypersonMLText) {
+                            const hasML = laypersonMLText || /[\u0D00-\u0D7F]/.test(laypersonText);
+                            const mlText = laypersonMLText || (hasML ? laypersonText : "");
+                            const enText = !laypersonMLText && !hasML ? laypersonText : "";
+                            
+                            let playButtonsHtml = '';
+                            let boxesHtml = '';
+                            
+                            if (mlText) {
+                                playButtonsHtml += `
+                                    <button onclick="speakText(\`${mlText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
+                                        🔊 Play Malayalam
+                                    </button>
+                                `;
+                                boxesHtml += `
+                                    <div class="ml-box" style="font-size: 14.5px; color: #e2e8f0; line-height: 1.6; font-family: 'Plus Jakarta Sans', sans-serif;">
+                                        <strong>മലയാളം:</strong> ${mlText}
+                                    </div>
+                                `;
+                            }
+                            if (enText) {
+                                playButtonsHtml += `
+                                    <button onclick="speakText(\`${enText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
+                                        🔊 Play English
+                                    </button>
+                                `;
+                                boxesHtml += `
+                                    <div class="en-box" style="font-size: 13.5px; color: #94a3b8; line-height: 1.5; font-style: italic; font-family: 'Plus Jakarta Sans', sans-serif;">
+                                        <strong>English:</strong> ${enText}
+                                    </div>
+                                `;
+                            }
+                            if (laypersonText && laypersonMLText) {
+                                playButtonsHtml = `
+                                    <button onclick="speakText(\`${laypersonMLText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
+                                        🔊 Play Malayalam
+                                    </button>
+                                    <button onclick="speakText(\`${laypersonText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
+                                        🔊 Play English
+                                    </button>
+                                `;
+                                boxesHtml = `
+                                    <div class="ml-box" style="font-size: 14.5px; color: #e2e8f0; line-height: 1.6; margin-bottom: 12px; font-family: 'Plus Jakarta Sans', sans-serif;">
+                                        <strong>മലയാളം:</strong> ${laypersonMLText}
+                                    </div>
+                                    <div class="en-box" style="font-size: 13.5px; color: #94a3b8; line-height: 1.5; font-style: italic; font-family: 'Plus Jakarta Sans', sans-serif;">
+                                        <strong>English:</strong> ${laypersonText}
+                                    </div>
+                                `;
+                            }
+
                             laypersonHtml = `
                                 <div class="layperson-advice-panel" style="margin-top: 6px; padding: 20px; border-radius: 12px; background: rgba(99, 102, 241, 0.05); border: 1px dashed rgba(99, 102, 241, 0.2); animation: fadeInUp 0.5s ease-out;">
                                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
@@ -978,20 +1028,10 @@
                                             Citizen Action Guide / ലളിതമായ ഉപദേശം
                                         </div>
                                         <div style="display: flex; gap: 8px;">
-                                            <button onclick="speakText(\`${laypersonMLText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
-                                                🔊 Play Malayalam
-                                            </button>
-                                            <button onclick="speakText(\`${laypersonText.replace(/`/g, '\\`').replace(/\n/g, ' ')}\`, this)" class="action-btn" style="padding: 4px 10px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; cursor: pointer; color: #fff; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
-                                                🔊 Play English
-                                            </button>
+                                            ${playButtonsHtml}
                                         </div>
                                     </div>
-                                    <div class="ml-box" style="font-size: 14.5px; color: #e2e8f0; line-height: 1.6; margin-bottom: 12px; font-family: 'Plus Jakarta Sans', sans-serif;">
-                                        <strong>മലയാളം:</strong> ${laypersonMLText}
-                                    </div>
-                                    <div class="en-box" style="font-size: 13.5px; color: #94a3b8; line-height: 1.5; font-style: italic; font-family: 'Plus Jakarta Sans', sans-serif;">
-                                        <strong>English:</strong> ${laypersonText}
-                                    </div>
+                                    ${boxesHtml}
                                 </div>
                             `;
                         }

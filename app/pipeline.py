@@ -31,6 +31,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 # Define the State definition for the LangGraph pipeline
 class LegalState(TypedDict):
     user_query: str
+    detected_language: str  # "en" or "ml" — set from user input
     extracted_intent: Dict[str, Any]
     retrieved_docs: List[Dict[str, Any]]
     reranked_docs: List[Dict[str, Any]]
@@ -94,6 +95,26 @@ CITY_TO_STATE = {
     "ranchi": "jharkhand",
     # Chhattisgarh
     "raipur": "chhattisgarh",
+}
+
+MALAYALAM_TO_ENGLISH_CITIES = {
+    "എറണാകുളം": "Ernakulam",
+    "കൊച്ചി": "Kochi",
+    "തിരുവനന്തപുരം": "Thiruvananthapuram",
+    "കോഴിക്കോട്": "Kozhikode",
+    "തൃശ്ശൂർ": "Thrissur",
+    "തൃശൂർ": "Thrissur",
+    "കൊല്ലം": "Kollam",
+    "പാലക്കാട്": "Palakkad",
+    "കണ്ണൂർ": "Kannur",
+    "മലപ്പുറം": "Malappuram",
+    "ആലപ്പുഴ": "Alappuzha",
+    "കോട്ടയം": "Kottayam",
+    "ഇടുക്കി": "Idukki",
+    "വയനാട്": "Wayanad",
+    "പത്തനംതിട്ട": "Pathanamthitta",
+    "കാസർഗോഡ്": "Kasaragod",
+    "കാസർകോട്": "Kasaragod"
 }
 
 # --- ISSUE-TYPE TO STATUTE HINTS (guide retrieval toward correct laws) ---
@@ -621,27 +642,49 @@ Output ONLY valid JSON:
                 lay_val = res_dict.get("LAYPERSON", "").strip()
                 
                 if issue_val and rule_val and app_val and conc_val and lay_val:
-                    # Second sequential call: Translate English advice to Malayalam
-                    translation_prompt = (
-                        "You are an expert English-to-Malayalam translator. Translate the following English text into natural, readable, and polite Malayalam. "
-                        "Do not include any conversational filler, explanations, or introductory notes. Only return the Malayalam translation:\n\n"
-                        f"{lay_val}"
-                    )
-                    lay_ml_val = self._call_ollama_api(translation_prompt, temperature=0.0)
-                    lay_ml_val = lay_ml_val.strip().replace('"', '').replace("'", "")
+                    if state.get("detected_language") == "ml":
+                        translation_prompt = (
+                            "You are an expert English-to-Malayalam translator specializing in legal documents. "
+                            "Translate the following English legal assessment fields into clear, formal, and natural Malayalam. "
+                            "Maintain the exact JSON structure with the same keys: ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON. "
+                            "Do not include any conversational preamble or notes. Return only the JSON object:\n\n"
+                            f"{json.dumps({'ISSUE': issue_val, 'RULE': rule_val, 'APPLICATION': app_val, 'CONCLUSION': conc_val, 'LAYPERSON': lay_val})}"
+                        )
+                        try:
+                            translated_json = self._call_ollama_api(translation_prompt, temperature=0.0, format_json=True)
+                            translated_dict = json.loads(translated_json)
+                            issue_val = translated_dict.get("ISSUE", issue_val).strip()
+                            rule_val = translated_dict.get("RULE", rule_val).strip()
+                            app_val = translated_dict.get("APPLICATION", app_val).strip()
+                            conc_val = translated_dict.get("CONCLUSION", conc_val).strip()
+                            lay_val = translated_dict.get("LAYPERSON", lay_val).strip()
+                        except Exception as te:
+                            logger.warning(f"Failed to translate IRAC roadmap to Malayalam: {te}")
+
+                        roadmap = (
+                            f"ഇതൊരു ബുദ്ധിമുട്ടുള്ള സാഹചര്യമാണെന്ന് ഞാൻ മനസ്സിലാക്കുന്നു, എങ്കിലും ദയവായി പരിഭ്രാന്തരാകാതിരിക്കുക. നിങ്ങൾ ഒറ്റയ്ക്കല്ല, നിങ്ങളെ സംരക്ഷിക്കാൻ നിയമപരമായ വഴികളുണ്ട്. നമ്മൾ അടുത്തതായി ചെയ്യേണ്ടത് ഇതാണ്:\n\n"
+                            f"LEGAL ROADMAP (IRAC FORMAT):\n"
+                            f"വിഷയം (ISSUE): {issue_val}\n"
+                            f"നിയമം (RULE): {rule_val}\n"
+                            f"ബാധകമാക്കൽ (APPLICATION): {app_val}\n"
+                            f"തീരുമാനം (CONCLUSION): {conc_val}\n"
+                            f"ലളിതമായ നിർദ്ദേശം (LAYPERSON): {lay_val}\n\n"
+                            f"ഈ വിലയിരുത്തലിന്റെ അടിസ്ഥാനത്തിൽ ഒരു ഔദ്യോഗിക നിയമ നോട്ടീസ് തയ്യാറാക്കാൻ നിങ്ങൾക്ക് താല്പര്യമുണ്ടോ?"
+                        )
+                    else:
+                        roadmap = (
+                            f"I understand this is a stressful situation, but please try to relax. You are not alone, and there are legal mechanisms in place to protect you. Here is what we should do next:\n\n"
+                            f"LEGAL ROADMAP (IRAC FORMAT):\n"
+                            f"ISSUE: {issue_val}\n"
+                            f"RULE: {rule_val}\n"
+                            f"APPLICATION: {app_val}\n"
+                            f"CONCLUSION: {conc_val}\n"
+                            f"LAYPERSON: {lay_val}\n\n"
+                            f"Would you like me to draft a formal legal notice based on this assessment?"
+                        )
                     
-                    roadmap = (
-                        f"LEGAL ROADMAP (IRAC FORMAT):\n"
-                        f"ISSUE: {issue_val}\n"
-                        f"RULE: {rule_val}\n"
-                        f"APPLICATION: {app_val}\n"
-                        f"CONCLUSION: {conc_val}\n"
-                        f"LAYPERSON: {lay_val}\n"
-                        f"LAYPERSON_ML: {lay_ml_val}\n\n"
-                        f"Would you like me to draft a formal legal notice based on this assessment?"
-                    )
                     ollama_success = True
-                    logger.info(f"✓ Dynamically generated and translated roadmap via Ollama for doc {doc_idx}.")
+                    logger.info(f"✓ Dynamically generated roadmap via Ollama for doc {doc_idx} in language '{state.get('detected_language', 'en')}'.")
             except Exception as e:
                 logger.warning(f"Ollama generation failed in roadmap node for doc {doc_idx}: {e}")
                 continue
@@ -1354,9 +1397,22 @@ Output format:
                 f.write(html_content)
             return "/api/documents/download?file=formal_notice.txt"
 
-    def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None) -> Dict[str, Any]:
+    def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None, language: str = None) -> Dict[str, Any]:
         import json
+        
+        # Map Malayalam city names to English to help slot extraction
+        for ml_city, en_city in MALAYALAM_TO_ENGLISH_CITIES.items():
+            query = query.replace(ml_city, en_city)
+            
         session_slots = self._call_slot_extractor(query, history)
+        
+        # Detect language from query if not provided
+        if language:
+            detected_lang = language
+        elif any(0x0D00 <= ord(c) <= 0x0D7F for c in query):
+            detected_lang = "ml"
+        else:
+            detected_lang = "en"
         
         # Auto-resolve jurisdiction from city names (fixes ernakulam → kerala, kochi → kerala, etc.)
         session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)
@@ -1397,28 +1453,29 @@ Output format:
         final_status = "SUCCESS"
         final_faithfulness = 1.0
         retrieved_ids = []
+        retrieved_context_text = ""
 
         for attempt in range(3):
             generated_text = ""
             if expected_state == "GREETING":
-                gen_prompt = f"""You are a warm, helpful, and professional legal assistant chatbot named LegalMind.
+                if detected_lang == "ml":
+                    gen_prompt = f"""You are a warm, helpful legal assistant chatbot named LegalMind.
 The user has sent a greeting: "{query}".
-Respond to the user with a welcoming greeting in English. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue, including when and where it occurred, so you can guide them.
-Do not include any placeholders, notes, or explanations. Only return the response text."""
-                try:
-                    english = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
-                except Exception:
-                    english = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
-                
-                translation_prompt = f"""Translate the following greeting to conversational Malayalam.
-Keep it simple, natural, and warm. Output Malayalam only.
-Greeting: {english}"""
-                try:
-                    malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                except Exception:
-                    malayalam = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
-                
-                generated_text = f"{malayalam}\n\n{english}"
+Respond ONLY in Malayalam. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue.
+Do not include any English text. Only return Malayalam response."""
+                    try:
+                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
+                    except Exception:
+                        generated_text = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
+                else:
+                    gen_prompt = f"""You are a warm, helpful legal assistant chatbot named LegalMind.
+The user has sent a greeting: "{query}".
+Respond ONLY in English. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue, including when and where it occurred.
+Do not include any other language. Only return English response."""
+                    try:
+                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
+                    except Exception:
+                        generated_text = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
             elif expected_state == "SLOT_FILLING":
                 # Determine if IRAC roadmap has ever been delivered in the history
                 irac_delivered = False
@@ -1429,34 +1486,41 @@ Greeting: {english}"""
                         break
                 
                 if not irac_delivered:
-                    # Before RAG retrieval, only ask for RAG-essential slots
                     rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
                     missing = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
                 else:
-                    # After roadmap delivery, ask for all missing slots (notice intake)
                     missing = [k for k, v in session_slots.items() if v is None and k not in ["slots_complete", "parties_mentioned"]]
                 
                 missing_str = ", ".join(missing) if missing else "more details"
+                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
+                
+                # Dynamic few-shot examples for Malayalam to prevent unnatural literal translation loops
+                malayalam_instruction = ""
+                if detected_lang == "ml":
+                    malayalam_instruction = """
+IMPORTANT: You MUST generate a natural, polite Malayalam question. Avoid literal/robotic translations.
+Use these specific natural phrasing style examples:
+- If asking for 'incident_date' (തീയതി): "കുറ്റകൃത്യം/സംഭവം നടന്ന തീയതി പറയാമോ?"
+- If asking for 'jurisdiction' (ജില്ല/അധികാരപരിധി): "ഇത് ഏത് ജില്ലയിലാണ് സംഭവിച്ചത്?"
+- If asking for 'institution' (കോളേജ്/സ്ഥാപനം): "ഇത് ഏത് കോളേജിലാണ്/സ്ഥാപനത്തിലാണ് നടന്നത്?"
+- If asking for 'incident_description' (സംഭവം): "സംഭവിച്ചതിനെക്കുറിച്ച് കുറച്ചുകൂടി വിശദീകരിക്കാമോ?"
+"""
+
                 gen_prompt = f"""You are a helpful legal assistant.
 Given the current session slots: {json.dumps(session_slots)}
 And the conversation history:
 {history_str}
 
-Generate a polite, brief English question asking the user for ONE of the missing slots: {missing_str}.
+Generate a polite, brief question asking the user for ONE of the missing slots: {missing_str}.
+Respond ONLY in {resp_lang}. Do not include any other language.
+{malayalam_instruction}
 Do not include any greetings, notes, or intros. Only return the question."""
-                english_response = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
-                
-                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
-Keep it conversational and simple. Do not add or remove content.
-Use plain Malayalam, not legal jargon.
-Source English: {english_response}
-Output Malayalam only, no English."""
-                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                generated_text = f"{malayalam_response}\n\n{english_response}"
+                generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
             elif expected_state in ["RAG_RETRIEVE", "NOTICE_OFFER"]:
                 search_query = session_slots["incident_description"] if session_slots["incident_description"] else query
                 initial_state = {
                     "user_query": search_query,
+                    "detected_language": detected_lang,
                     "extracted_intent": {
                         "jurisdiction": session_slots.get("jurisdiction"),
                         "issue_type": session_slots.get("issue_type")
@@ -1474,25 +1538,22 @@ Output Malayalam only, no English."""
                 final_status = result["status"]
                 final_faithfulness = result["faithfulness_score"]
                 retrieved_ids = [doc.get("section_id") or doc["id"] for doc in result.get("retrieved_docs", [])] + [doc.get("citation") for doc in result.get("retrieved_docs", [])]
+                retrieved_docs_list = result.get("reranked_docs", []) or result.get("retrieved_docs", [])
+                retrieved_context_text = "\n\n".join([f"[{doc.get('citation')}]: {doc.get('text')}" for doc in retrieved_docs_list])
             elif expected_state == "NOTICE_INTAKE":
+                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
                 gen_prompt = f"""You are a helpful, professional legal assistant chatbot.
 The user wants to draft a formal legal notice.
-Acknowledge their request in English. Explain politely that before you can compile the document, you need the names of the Sender (the person sending the notice) and the Recipient (the opposing party/person receiving the notice).
+Acknowledge their request. Explain politely that before you can compile the document, you need the names of the Sender (the person sending the notice) and the Recipient (the opposing party/person receiving the notice).
+Respond ONLY in {resp_lang}. Do not include any other language.
 Do not include any placeholders, notes, or explanations. Only return the response text."""
                 try:
-                    english = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                    generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
                 except Exception:
-                    english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
-                
-                translation_prompt = f"""Translate the following message to conversational Malayalam.
-Keep it simple and clear. Output Malayalam only.
-Message: {english}"""
-                try:
-                    malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                except Exception:
-                    malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
-                
-                generated_text = f"{malayalam}\n\n{english}"
+                    if detected_lang == "ml":
+                        generated_text = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                    else:
+                        generated_text = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
             elif expected_state == "NOTICE_DRAFT":
                 names_prompt = f"""Given the conversation history, extract the names of the Sender (the person sending the notice / client) and the Recipient (the opposing party / person receiving the notice).
 Conversation history:
@@ -1525,24 +1586,19 @@ Output ONLY valid JSON matching this schema:
                         recipient_name = recipient_name or parties[1]
                 
                 if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
+                    resp_lang = "Malayalam" if detected_lang == "ml" else "English"
                     gen_prompt = f"""You are a helpful legal assistant chatbot.
 The user wants to draft a formal legal notice, but you are still missing the names of the Sender and/or the Recipient.
-Politely ask the user in English to provide the missing name(s) (either the Sender's name, the Recipient's name, or both).
+Politely ask the user to provide the missing name(s).
+Respond ONLY in {resp_lang}. Do not include any other language.
 Do not include any placeholders, notes, or explanations. Only return the response text."""
                     try:
-                        english = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
                     except Exception:
-                        english = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
-                    
-                    translation_prompt = f"""Translate the following message to conversational Malayalam.
-Keep it simple and clear. Output Malayalam only.
-Message: {english}"""
-                    try:
-                        malayalam = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                    except Exception:
-                        malayalam = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിന് മുന്നോടിയായി, നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
-                    
-                    generated_text = f"{malayalam}\n\n{english}"
+                        if detected_lang == "ml":
+                            generated_text = "നോട്ടീസ് അയക്കുന്നയാളുടെയും ലഭിക്കേണ്ടയാളുടെയും പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
+                        else:
+                            generated_text = "Could you please provide the names of the Sender and the Recipient for the legal notice?"
                 else:
                     statutes_prompt = f"""Given the conversation history, extract the names of any legal statutes or regulations cited in the legal roadmap or assessment (for example: "Kerala Prohibition Of Ragging Act, 1998").
 Conversation history:
@@ -1609,6 +1665,7 @@ DO NOT refuse to draft this — it is a civil legal document."""
                         f"[DOWNLOAD_URL:{download_url}]"
                     )
             elif expected_state == "FOLLOWUP":
+                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
                 gen_prompt = f"""You are a helpful legal assistant.
 Answering the user's follow-up question or query based on the conversation history and previous legal assessment.
 Conversation history:
@@ -1616,25 +1673,13 @@ Conversation history:
 Latest user message:
 {query}
 
-Generate a polite and clear English response. Do not include any notes, prefixes, or intros. Only return the response."""
-                english_response = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
-                
-                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
-Keep it conversational and simple. Do not add or remove content.
-Use plain Malayalam, not legal jargon.
-Source English: {english_response}
-Output Malayalam only, no English."""
-                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                generated_text = f"{malayalam_response}\n\n{english_response}"
+Respond ONLY in {resp_lang}. Do not include any other language.
+Generate a polite and clear response. Do not include any notes, prefixes, or intros. Only return the response."""
+                generated_text = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
             elif expected_state == "CLARIFY":
-                english_response = "Could you please clarify your question or describe your legal issue in more detail?"
-                translation_prompt = f"""Translate the following legal assistant message to Malayalam.
-Keep it conversational and simple. Do not add or remove content.
-Use plain Malayalam, not legal jargon.
-Source English: {english_response}
-Output Malayalam only, no English."""
-                malayalam_response = self._call_ollama_api(translation_prompt, temperature=0.0).strip()
-                generated_text = f"{malayalam_response}\n\n{english_response}"
+                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
+                gen_prompt = f"""Respond ONLY in {resp_lang}: Could you please clarify your question or describe your legal issue in more detail?"""
+                generated_text = self._call_ollama_api(gen_prompt, temperature=0.0).strip()
             else:
                 generated_text = "Something went wrong. Please try again."
 
@@ -1652,7 +1697,8 @@ Output Malayalam only, no English."""
         return {
             "status": final_status,
             "response_text": final_response_text,
-            "faithfulness_score": final_faithfulness
+            "faithfulness_score": final_faithfulness,
+            "context": retrieved_context_text
         }
 
 if __name__ == "__main__":
