@@ -1059,22 +1059,31 @@ Output ONLY valid JSON:
             history_lines.append(f"[{role}]: {text}")
         history_str = "\n".join(history_lines)
         
-        current_date_str = "2026-06-13"  # Mocked current date corresponding to conversation local time
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
         
         prompt = f"""You are an accurate, objective slot extractor for a legal intake system.
 Your job is to read the conversation history and the latest user message, and extract specific details of the user's legal issue.
 
 CRITICAL RULES:
 - Do NOT hallucinate. Do NOT invent details.
-- Only extract a value if it is explicitly mentioned or clearly implied in the conversation.
+- Only extract a value if it is EXPLICITLY and CLEARLY mentioned in the conversation.
 - If a detail is NOT mentioned anywhere in the conversation history or latest message, you MUST return null for that slot.
 - For example, if the user has only said a greeting like "hi", "hello", "hey", all slots MUST be null.
 - Do NOT output placeholder names like "name1", "name2", "college name", "facing ragging at college", or similar unless they are actually written in the user messages.
 
+ISSUE_TYPE EXTRACTION — BE ULTRA CONSERVATIVE:
+- "ragging" ONLY if the user literally uses the word "ragging", "rag", "senior bullying in college", "seniors harassing juniors" or describes being bullied by seniors in an educational institution.
+- "eviction" ONLY if the user explicitly describes being asked to leave/vacate a rented room/house/building by a landlord/owner.
+- "wage_theft" ONLY if the user explicitly describes unpaid salary, withheld wages, or non-payment by an employer.
+- "consumer" ONLY if the user explicitly describes a defective product, deficient service, or consumer fraud.
+- "other" if the user describes a legal issue that does NOT fit any of the above categories.
+- null if the user has NOT described any legal issue yet (e.g., greetings, unclear messages, audio transcription noise).
+- NEVER guess the issue type from ambiguous or noisy transcriptions. If unsure, return null.
+
 Current local date: {current_date_str}
 
 Please output a JSON object containing the values of the following slots based strictly on the conversation:
-- "issue_type": Must be one of "ragging", "eviction", "wage_theft", "consumer", "other", or null. Only set this if the user describes a legal issue.
+- "issue_type": Must be one of "ragging", "eviction", "wage_theft", "consumer", "other", or null.
 - "incident_date": The date of the incident (YYYY-MM-DD) or null. If the user mentions a relative date like "yesterday", resolve it relative to the current local date ({current_date_str}) to a YYYY-MM-DD format. Otherwise, if no date/time is mentioned, return null.
 - "jurisdiction": The Indian state name where the incident occurred, or null.
 - "institution": The name of the college, company, school, or landlord's building mentioned, or null.
@@ -1122,6 +1131,31 @@ Output format:
             req_fields = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
             is_complete = all(res_dict.get(f) is not None and str(res_dict.get(f)).lower() != "null" and str(res_dict.get(f)).strip() != "" for f in req_fields)
             res_dict["slots_complete"] = is_complete
+            
+            # ISSUE-TYPE VERIFICATION: Cross-check the extracted issue_type against the user's actual words
+            # This prevents hallucinated issue types from noisy Whisper transcriptions
+            extracted_issue = res_dict.get("issue_type")
+            if extracted_issue and extracted_issue in ["ragging", "eviction", "wage_theft", "consumer"]:
+                all_user_text = query.lower()
+                for turn in (history or []):
+                    if turn.get("role") == "user":
+                        all_user_text += " " + (turn.get("text") or "").lower()
+                
+                # Define keyword anchors that MUST be present for each issue type
+                issue_keywords = {
+                    "ragging": ["ragging", "rag", "senior", "seniors", "junior", "juniors", "hostel bully", "college bully", "റാഗിങ്"],
+                    "eviction": ["evict", "eviction", "vacate", "landlord", "rent", "tenant", "house owner", "room owner", "ഒഴിപ്പിക്ക", "വീട്ടുടമ", "കുടിയിറക്ക"],
+                    "wage_theft": ["salary", "wage", "pay", "unpaid", "compensation", "ശമ്പള", "ശമ്പളം", "വേതന"],
+                    "consumer": ["consumer", "product", "defective", "refund", "service", "ഉപഭോക്ത"]
+                }
+                
+                keywords = issue_keywords.get(extracted_issue, [])
+                has_keyword = any(kw in all_user_text for kw in keywords)
+                
+                if not has_keyword:
+                    logger.warning(f"Issue-type verification FAILED: LLM extracted '{extracted_issue}' but no matching keywords found in user text. Resetting to 'other'.")
+                    res_dict["issue_type"] = "other"
+                    # Recheck slots_complete since issue_type changed but is still non-null
             
             return res_dict
         except Exception as e:
@@ -1208,50 +1242,6 @@ Output ONLY the state name (NOTICE_INTAKE, FOLLOWUP, or NOTICE_DRAFT). Do not in
             if not slots.get("slots_complete"):
                 return "SLOT_FILLING"
             return "RAG_RETRIEVE"
-
-        # Format history so far
-        history_lines = []
-        for turn in (history or []):
-            role = "User" if turn.get("role") == "user" else "Assistant"
-            text = turn.get("text") or turn.get("response_text") or ""
-            history_lines.append(f"[{role}]: {text}")
-        history_str = "\n".join(history_lines)
-
-        prompt = f"""You are a dialogue state router for a legal assistant.
-
-Given the session state and conversation history, output the next state.
-
-Session slots: {json.dumps(slots)}
-Slots complete: {slots.get('slots_complete')}
-IRAC roadmap delivered: {irac_delivered}
-Last assistant action: {last_state}
-Latest user message: {query}
-
-Conversation history so far:
-{history_str}
-
-DECISION FLOW (Evaluate these rules sequentially from 1 to 6. Output the first matching state):
-1. If conversation history is empty and this is the first turn -> GREETING
-2. If Slots complete is false -> SLOT_FILLING
-3. If Slots complete is true AND IRAC roadmap delivered is false -> RAG_RETRIEVE
-4. If sender_name and recipient_name in Session slots are both non-null (not null) -> NOTICE_DRAFT
-5. If Last assistant action is NOTICE_OFFER AND the user message expresses consent/yes -> NOTICE_INTAKE
-6. If IRAC roadmap delivered is true AND Last assistant action is NOTICE_OFFER AND the user says NO/declines -> FOLLOWUP
-7. If IRAC roadmap delivered is true AND the user asks a follow-up question -> FOLLOWUP
-8. Otherwise -> CLARIFY
-
-Output ONLY the state name (e.g. GREETING, SLOT_FILLING, RAG_RETRIEVE, NOTICE_OFFER, NOTICE_INTAKE, NOTICE_DRAFT, FOLLOWUP, CLARIFY). Do not explain or add other text.
-"""
-        try:
-            expected_state = self._call_ollama_api(prompt, temperature=0.0).strip().upper()
-            # Clean up state string
-            for st in ["GREETING", "SLOT_FILLING", "RAG_RETRIEVE", "NOTICE_OFFER", "NOTICE_INTAKE", "NOTICE_DRAFT", "FOLLOWUP", "CLARIFY"]:
-                if st in expected_state:
-                    return st
-            return "SLOT_FILLING"
-        except Exception as e:
-            logger.warning(f"State router failed: {e}")
-            return "SLOT_FILLING"
 
     def _call_shield_validator(self, expected_state: str, slots: Dict[str, Any], response: str, retrieved_ids: List[str], last_assistant_response: str) -> Dict[str, Any]:
         import json
@@ -1608,7 +1598,7 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     try:
                         statutes_cited = self._call_ollama_api(statutes_prompt, temperature=0.0).strip()
                     except Exception:
-                        statutes_cited = "Kerala Prohibition Of Ragging Act, 1998"
+                        statutes_cited = "Applicable Indian statutes as discussed in the assessment"
                     
                     from datetime import date
                     notice_date = date.today().strftime("%d %B %Y")
@@ -1681,7 +1671,22 @@ Generate a polite and clear response. Do not include any notes, prefixes, or int
                 gen_prompt = f"""Respond ONLY in {resp_lang}: Could you please clarify your question or describe your legal issue in more detail?"""
                 generated_text = self._call_ollama_api(gen_prompt, temperature=0.0).strip()
             else:
-                generated_text = "Something went wrong. Please try again."
+                # Unknown state — use LLM to generate a contextual response
+                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
+                gen_prompt = f"""You are a helpful legal assistant chatbot named LegalMind.
+The user sent: "{query}"
+Conversation history:
+{history_str}
+
+Respond helpfully in {resp_lang}. If you cannot understand their request, ask them to clarify.
+Do not include any notes, prefixes, or intros. Only return the response."""
+                try:
+                    generated_text = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
+                except Exception:
+                    if detected_lang == "ml":
+                        generated_text = "എനിക്ക് മനസ്സിലായില്ല. ദയവായി നിങ്ങളുടെ നിയമപരമായ പ്രശ്നം വിശദീകരിക്കാമോ?"
+                    else:
+                        generated_text = "I didn't quite understand that. Could you please describe your legal issue in more detail?"
 
             shield_res = self._call_shield_validator(expected_state, session_slots, generated_text, retrieved_ids, last_assistant_response)
             score = shield_res.get("score", 1.0)
@@ -1693,6 +1698,14 @@ Generate a polite and clear response. Do not include any notes, prefixes, or int
             else:
                 logger.warning(f"Shield validation failed for attempt {attempt + 1}: {shield_res.get('fail_reasons')}")
                 final_response_text = generated_text
+
+        # GUARANTEED NON-EMPTY RESPONSE — never return empty text
+        if not final_response_text or not final_response_text.strip():
+            logger.error("Pipeline produced empty response! Generating fallback.")
+            if detected_lang == "ml":
+                final_response_text = "എനിക്ക് മനസ്സിലായില്ല. ദയവായി നിങ്ങളുടെ പ്രശ്നം വിശദീകരിക്കാമോ?"
+            else:
+                final_response_text = "I apologize, but I couldn't process your request. Could you please describe your legal issue again?"
 
         return {
             "status": final_status,

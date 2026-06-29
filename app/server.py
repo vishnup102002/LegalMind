@@ -606,6 +606,14 @@ async def whatsapp_webhook(
         result = pipeline.run(user_message, history=history, language=session.get("lang"))
         response_text = result["response_text"]
         
+        # CRITICAL: Never proceed with empty response — fallback
+        if not response_text or not response_text.strip():
+            logger.error(f"Pipeline returned empty response for {From}! Sending fallback.")
+            if session.get("lang") == "ml":
+                response_text = "എനിക്ക് മനസ്സിലായില്ല. ദയവായി വീണ്ടും ശ്രമിക്കുക."
+            else:
+                response_text = "I couldn't process your message. Please try again or send /reset to start over."
+        
         # Format message for WhatsApp
         whatsapp_reply = format_for_whatsapp(response_text)
 
