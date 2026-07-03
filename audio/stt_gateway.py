@@ -16,6 +16,7 @@ class ShrutamAudioTranscriber:
         self._last_audio_hash = None
         self._last_transcript = ""
         self._last_language = "en"
+        self._last_language_hint = None
         
         # Load local whisper-tiny as fallback ASR
         try:
@@ -96,25 +97,51 @@ class ShrutamAudioTranscriber:
         """Runs ASR using Groq Cloud API, falling back to local Whisper-tiny on failure."""
         audio_hash = self._get_audio_hash(audio_bytes)
         
-        # Check cache
-        if audio_hash == self._last_audio_hash:
+        # Check cache — but invalidate if language hint changed (prevents stale Tamil transcriptions)
+        if audio_hash == self._last_audio_hash and self._last_language_hint == language:
             logger.info("Serving ASR result from local transcriber cache.")
             return self._last_transcript, self._last_language
 
-        # 1. Try Groq Cloud Whisper API (Highly accurate and fast for Malayalam)
+        # 1. Try Groq Cloud Whisper API
         try:
-            transcript, lang = self._process_cloud_groq_asr(audio_bytes, language=language)
+            # CRITICAL FIX: If session language is Malayalam, ALWAYS force language='ml'
+            # Whisper frequently misdetects Malayalam as Tamil, producing garbled Tamil script
+            effective_language = language
+            if language == "ml":
+                effective_language = "ml"  # Force Malayalam hint
             
-            # Script hallucination guard: if detected language is Malayalam but no Malayalam unicode chars are found
-            if lang == "ml" and not language:
+            transcript, lang = self._process_cloud_groq_asr(audio_bytes, language=effective_language)
+            
+            # Script hallucination guard 1: Malayalam detected but no Malayalam chars
+            if lang == "ml" and not effective_language:
                 has_malayalam_chars = any(0x0D00 <= ord(c) <= 0x0D7F for c in transcript)
                 if not has_malayalam_chars:
-                    logger.warning("Detected Malayalam language but transcript contains no Malayalam characters. Script hallucination suspected. Retrying with explicit language='ml'...")
+                    logger.warning("Detected Malayalam but transcript has no Malayalam chars. Retrying with language='ml'...")
                     transcript, lang = self._process_cloud_groq_asr(audio_bytes, language="ml")
+            
+            # Script hallucination guard 2: Tamil detected but session is Malayalam
+            # Whisper frequently confuses Malayalam and Tamil
+            if lang == "ta" and (language == "ml" or language is None):
+                has_tamil_chars = any(0x0B80 <= ord(c) <= 0x0BFF for c in transcript)
+                has_malayalam_chars = any(0x0D00 <= ord(c) <= 0x0D7F for c in transcript)
+                if has_tamil_chars and not has_malayalam_chars:
+                    logger.warning(f"Whisper detected Tamil but session language is '{language}'. Malayalam→Tamil confusion suspected. Retrying with explicit language='ml'...")
+                    transcript_retry, lang_retry = self._process_cloud_groq_asr(audio_bytes, language="ml")
+                    # Use the retry result if it produced Malayalam characters
+                    has_ml_retry = any(0x0D00 <= ord(c) <= 0x0D7F for c in transcript_retry)
+                    if has_ml_retry or lang_retry == "ml":
+                        transcript = transcript_retry
+                        lang = "ml"
+                        logger.info("✓ Malayalam retry successful — using corrected transcription.")
+                    else:
+                        # Still no Malayalam chars — force lang to 'ml' anyway since user spoke Malayalam
+                        lang = "ml"
+                        logger.warning("Malayalam retry did not produce Malayalam chars, but forcing lang='ml' based on session.")
                     
             self._last_audio_hash = audio_hash
             self._last_transcript = transcript
             self._last_language = lang
+            self._last_language_hint = language
             return transcript, lang
         except Exception as cloud_err:
             logger.warning(f"Groq Cloud Whisper API failed: {cloud_err}. Falling back to local Whisper-tiny.")

@@ -1401,8 +1401,19 @@ Output format:
             detected_lang = language
         elif any(0x0D00 <= ord(c) <= 0x0D7F for c in query):
             detected_lang = "ml"
+        elif any(0x0B80 <= ord(c) <= 0x0BFF for c in query):
+            # Tamil script detected — likely Malayalam→Tamil Whisper confusion
+            # Treat as Malayalam since our users are Malayalam speakers
+            detected_lang = "ml"
+            logger.info("Tamil script detected in query — treating as Malayalam (Whisper confusion)")
         else:
             detected_lang = "en"
+        
+        # CRITICAL FIX: If language was passed as 'ta' (Tamil), map to 'ml' (Malayalam)
+        # Whisper frequently confuses these two Dravidian languages
+        if detected_lang == "ta":
+            detected_lang = "ml"
+            logger.info("Language 'ta' corrected to 'ml' (Malayalam-Tamil Whisper confusion)")
         
         # Auto-resolve jurisdiction from city names (fixes ernakulam → kerala, kochi → kerala, etc.)
         session_slots = self._resolve_jurisdiction_from_text(session_slots, query, history)

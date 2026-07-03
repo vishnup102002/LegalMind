@@ -567,10 +567,23 @@ async def whatsapp_webhook(
             try:
                 with urllib.request.urlopen(req, timeout=30) as response:
                     audio_bytes = response.read()
-                    transcription = transcriber.transcribe(audio_bytes, language=session_lang)
-                    # Detect input language from audio content
-                    detected_input_lang = transcriber.detect_language(audio_bytes, language=session_lang)
-                    logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription}' (lang={detected_input_lang})")
+                    
+                    # CRITICAL FIX: For the FIRST voice note, pass no language hint 
+                    # so Whisper auto-detects. For subsequent notes, pass session language
+                    # to prevent Tamil misdetection loops.
+                    transcription_hint = session_lang
+                    
+                    transcription = transcriber.transcribe(audio_bytes, language=transcription_hint)
+                    detected_input_lang = transcriber.detect_language(audio_bytes, language=transcription_hint)
+                    
+                    # CRITICAL FIX: If Whisper detected Tamil ("ta") but user is likely Malayalam,
+                    # force retry with "ml" hint. Tamil and Malayalam are frequently confused.
+                    if detected_input_lang == "ta" and (session_lang is None or session_lang == "ml"):
+                        logger.warning(f"Tamil detected but session_lang={session_lang}. Forcing Malayalam retry...")
+                        transcription = transcriber.transcribe(audio_bytes, language="ml")
+                        detected_input_lang = "ml"
+                    
+                    logger.info(f"✓ Transcribed WhatsApp voice note: '{transcription[:100]}' (lang={detected_input_lang})")
                     user_message = transcription
                     is_voice_input = True
             except Exception as e:
@@ -589,9 +602,11 @@ async def whatsapp_webhook(
  
     # 3. Load session history (session loaded early at start)
     
-    # Bug 1 Fix: Set language on session start and stick to it
+    # CRITICAL FIX: Set language on session start and STICK to it.
+    # If first input is voice and detected as Malayalam, lock to Malayalam.
     if "lang" not in session:
         session["lang"] = detected_input_lang
+        logger.info(f"Session language locked to '{detected_input_lang}' for {phone_number}")
         
     # Bug 3 Fix: Track user modality and stick to it
     if is_voice_input:
