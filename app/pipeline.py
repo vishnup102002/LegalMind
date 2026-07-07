@@ -1064,6 +1064,13 @@ Output ONLY valid JSON:
         prompt = f"""You are an accurate, objective slot extractor for a legal intake system.
 Your job is to read the conversation history and the latest user message, and extract specific details of the user's legal issue.
 
+LANGUAGE HANDLING — CRITICAL:
+- The user message may be in Malayalam, English, Manglish (romanized Malayalam), or a mix of these.
+- If the message is in Malayalam script (e.g., "ഞാൻ Kochi-ൽ ജോലി ചെയ്യുന്നു, ശമ്പളം തന്നിട്ടില്ല") — understand the meaning and extract slot values in English.
+- Do NOT return null for incident_description if the user clearly described a problem, even if the entire text is in Malayalam.
+- Translate Malayalam content to English for the JSON field values.
+- Common Malayalam legal terms: ശമ്പളം/വേതനം = salary/wages, ഒഴിപ്പിക്കൽ/കുടിയിറക്കൽ = eviction, റാഗിങ് = ragging, വീട്ടുടമ = landlord, കോളേജ് = college, പോലീസ് = police, കമ്പനി = company.
+
 CRITICAL RULES:
 - Do NOT hallucinate. Do NOT invent details.
 - Only extract a value if it is EXPLICITLY and CLEARLY mentioned in the conversation.
@@ -1072,10 +1079,10 @@ CRITICAL RULES:
 - Do NOT output placeholder names like "name1", "name2", "college name", "facing ragging at college", or similar unless they are actually written in the user messages.
 
 ISSUE_TYPE EXTRACTION — BE ULTRA CONSERVATIVE:
-- "ragging" ONLY if the user literally uses the word "ragging", "rag", "senior bullying in college", "seniors harassing juniors" or describes being bullied by seniors in an educational institution.
-- "eviction" ONLY if the user explicitly describes being asked to leave/vacate a rented room/house/building by a landlord/owner.
-- "wage_theft" ONLY if the user explicitly describes unpaid salary, withheld wages, or non-payment by an employer.
-- "consumer" ONLY if the user explicitly describes a defective product, deficient service, or consumer fraud.
+- "ragging" ONLY if the user literally uses the word "ragging", "rag", "senior bullying in college", "seniors harassing juniors", "റാഗിങ്", or describes being bullied by seniors in an educational institution.
+- "eviction" ONLY if the user explicitly describes being asked to leave/vacate a rented room/house/building by a landlord/owner, or uses words like "ഒഴിപ്പിക്ക", "കുടിയിറക്ക", "വീട്ടുടമ".
+- "wage_theft" ONLY if the user explicitly describes unpaid salary, withheld wages, or non-payment by an employer, or uses words like "ശമ്പളം തന്നിട്ടില്ല", "വേതനം", "ശമ്പളം".
+- "consumer" ONLY if the user explicitly describes a defective product, deficient service, or consumer fraud, or uses words like "ഉപഭോക്തൃ", "സേവനം".
 - "other" if the user describes a legal issue that does NOT fit any of the above categories.
 - null if the user has NOT described any legal issue yet (e.g., greetings, unclear messages, audio transcription noise).
 - NEVER guess the issue type from ambiguous or noisy transcriptions. If unsure, return null.
@@ -1084,12 +1091,12 @@ Current local date: {current_date_str}
 
 Please output a JSON object containing the values of the following slots based strictly on the conversation:
 - "issue_type": Must be one of "ragging", "eviction", "wage_theft", "consumer", "other", or null.
-- "incident_date": The date of the incident (YYYY-MM-DD) or null. If the user mentions a relative date like "yesterday", resolve it relative to the current local date ({current_date_str}) to a YYYY-MM-DD format. Otherwise, if no date/time is mentioned, return null.
-- "jurisdiction": The Indian state name where the incident occurred, or null.
+- "incident_date": The date of the incident (YYYY-MM-DD) or null. If the user mentions a relative date like "yesterday" or "ഇന്നലെ", resolve it relative to the current local date ({current_date_str}) to a YYYY-MM-DD format. Otherwise, if no date/time is mentioned, return null.
+- "jurisdiction": The Indian state name where the incident occurred, or null. Translate Malayalam place names to English (e.g., എറണാകുളം = Ernakulam, കൊച്ചി = Kochi).
 - "institution": The name of the college, company, school, or landlord's building mentioned, or null.
-- "incident_description": A brief one-sentence description of the incident as described by the user, or null.
+- "incident_description": A brief one-sentence English summary of the incident as described by the user, or null. If the user described the incident in Malayalam, translate and summarize it in English here.
 - "parties_mentioned": A list of names of specific individuals involved (excluding generic terms like 'sender' or 'recipient'), or [].
-- "sender_name": The name of the sender/complainant/client sending the notice, or null. Only extract if explicitly provided (e.g., "sender is Vishnu" or "my name is Vishnu").
+- "sender_name": The name of the sender/complainant/client sending the notice, or null. Only extract if explicitly provided (e.g., "sender is Vishnu" or "my name is Vishnu" or "എന്റെ പേര് വിഷ്ണു").
 - "recipient_name": The name of the recipient/respondent/opposing party receiving the notice, or null. Only extract if explicitly provided (e.g., "recipient is Kavya" or "opposing party is Kavya").
 
 Conversation history:
@@ -1106,7 +1113,7 @@ Output format:
   "incident_date": "YYYY-MM-DD" or null,
   "jurisdiction": "state name" or null,
   "institution": "institution name" or null,
-  "incident_description": "description text" or null,
+  "incident_description": "English summary of what happened" or null,
   "parties_mentioned": ["name"] or [],
   "sender_name": "sender name" or null,
   "recipient_name": "recipient name" or null
@@ -1387,8 +1394,9 @@ Output format:
                 f.write(html_content)
             return "/api/documents/download?file=formal_notice.txt"
 
-    def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None, language: str = None) -> Dict[str, Any]:
+    def run(self, query: str, history: List[Dict[str, str]] = None, threshold: float = None, language: str = None, **kwargs) -> Dict[str, Any]:
         import json
+        self._last_slot_attempts = kwargs.get("slot_attempts", {})
         
         # Map Malayalam city names to English to help slot extraction
         for ml_city, en_city in MALAYALAM_TO_ENGLISH_CITIES.items():
@@ -1486,25 +1494,64 @@ Do not include any other language. Only return English response."""
                         irac_delivered = True
                         break
                 
+                
+                rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
                 if not irac_delivered:
-                    rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
                     missing = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
                 else:
                     missing = [k for k, v in session_slots.items() if v is None and k not in ["slots_complete", "parties_mentioned"]]
                 
+                # --- FIX 2: Slot attempt loop guard ---
+                # Track how many times we've asked for each slot.
+                # If we've asked ≥2 times and user gave substantive text, force-fill.
+                slot_attempts = kwargs.get("slot_attempts", {})
+                if missing:
+                    primary_slot = missing[0]
+                    attempt_count = slot_attempts.get(primary_slot, 0)
+                    
+                    if attempt_count >= 2 and len(query) > 15:
+                        # User answered twice with substantive text — accept raw input and move on
+                        logger.warning(f"Slot '{primary_slot}' asked {attempt_count} times. Force-filling with user message.")
+                        session_slots[primary_slot] = query[:300]
+                        # Recalculate missing and slots_complete
+                        missing = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
+                        req_fields = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+                        session_slots["slots_complete"] = all(
+                            session_slots.get(f) is not None and str(session_slots.get(f)).lower() != "null" and str(session_slots.get(f)).strip() != ""
+                            for f in req_fields
+                        )
+                        if not missing or session_slots.get("slots_complete"):
+                            # All slots filled — skip to RAG
+                            expected_state = "RAG_RETRIEVE"
+                            slot_attempts[primary_slot] = 0  # Reset
+                            # Store updated attempts for caller
+                            self._last_slot_attempts = slot_attempts
+                            # Re-run this iteration with RAG_RETRIEVE
+                            continue
+                    
+                    # Increment attempt counter for the primary missing slot
+                    slot_attempts[primary_slot] = attempt_count + 1
+                    self._last_slot_attempts = slot_attempts
+                
                 missing_str = ", ".join(missing) if missing else "more details"
                 resp_lang = "Malayalam" if detected_lang == "ml" else "English"
                 
-                # Dynamic few-shot examples for Malayalam to prevent unnatural literal translation loops
+                # Dynamic few-shot examples for Malayalam — FIX 4: natural conversational phrasing
                 malayalam_instruction = ""
                 if detected_lang == "ml":
                     malayalam_instruction = """
-IMPORTANT: You MUST generate a natural, polite Malayalam question. Avoid literal/robotic translations.
-Use these specific natural phrasing style examples:
-- If asking for 'incident_date' (തീയതി): "കുറ്റകൃത്യം/സംഭവം നടന്ന തീയതി പറയാമോ?"
-- If asking for 'jurisdiction' (ജില്ല/അധികാരപരിധി): "ഇത് ഏത് ജില്ലയിലാണ് സംഭവിച്ചത്?"
-- If asking for 'institution' (കോളേജ്/സ്ഥാപനം): "ഇത് ഏത് കോളേജിലാണ്/സ്ഥാപനത്തിലാണ് നടന്നത്?"
-- If asking for 'incident_description' (സംഭവം): "സംഭവിച്ചതിനെക്കുറിച്ച് കുറച്ചുകൂടി വിശദീകരിക്കാമോ?"
+IMPORTANT: You MUST generate a natural, warm, conversational Malayalam question. 
+Do NOT use literal/robotic translations of English labels.
+Do NOT use words like "വിവരണം", "നൽകുകയാണോ?", "ജില്ലാ പേര്" — these sound robotic and unnatural.
+
+Use EXACTLY these natural phrasing styles:
+- If asking for 'incident_description': "എന്ത് സംഭവിച്ചതെന്ന് പറയാമോ?" (What happened?)
+- If asking for 'incident_date': "ഇത് എപ്പോൾ നടന്നതാണ്?" (When did this happen?)
+- If asking for 'jurisdiction': "ഇത് ഏത് ജില്ലയിലാണ് നടന്നത്?" (Which district did this happen in?)
+- If asking for 'institution': "ഏത് സ്ഥാപനത്തിലാണ് ഇത് നടന്നത്?" (Which institution did this happen at?)
+- If asking for 'issue_type': "എന്ത് തരത്തിലുള്ള പ്രശ്നമാണ് നിങ്ങൾ നേരിടുന്നത്?" (What kind of problem are you facing?)
+
+Generate ONLY one short question. Do not repeat previous questions.
 """
 
                 gen_prompt = f"""You are a helpful legal assistant.
@@ -1722,7 +1769,8 @@ Do not include any notes, prefixes, or intros. Only return the response."""
             "status": final_status,
             "response_text": final_response_text,
             "faithfulness_score": final_faithfulness,
-            "context": retrieved_context_text
+            "context": retrieved_context_text,
+            "slot_attempts": getattr(self, '_last_slot_attempts', {})
         }
 
 if __name__ == "__main__":

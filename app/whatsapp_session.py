@@ -60,7 +60,8 @@ class WhatsAppSessionManager:
             "irac_delivered": False,
             "notice_consent": None,
             "history": [],
-            "greeted": False
+            "greeted": False,
+            "slot_attempts": {}
         }
 
     def save(self, phone: str, session: dict):

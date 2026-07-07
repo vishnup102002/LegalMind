@@ -507,6 +507,73 @@ def send_whatsapp_audio(to: str, media_url: str, caption: str = ""):
     except Exception as e:
         logger.error(f"Failed to send WhatsApp audio to {to}: {e}")
 
+def send_whatsapp_response(to: str, text: str, session: dict, download_url: str = None):
+    """Unified response sender. Always sends text, then TTS audio for voice sessions,
+    then document attachment if present. This ensures voice users ALWAYS get audio replies."""
+    import shutil
+    
+    phone_number = to.replace("whatsapp:", "")
+    
+    # 1. ALWAYS send text first (Twilio sandbox drops document-only messages)
+    send_whatsapp_text(to, text)
+    
+    # 2. Send document attachment if present
+    if download_url:
+        try:
+            caption = "📄 Formal Legal Notice (download)"
+            send_whatsapp_document(to, download_url, caption)
+        except Exception as doc_err:
+            logger.warning(f"Document send failed (text was already sent): {doc_err}")
+    
+    # 3. Voice-to-voice: If user modality is voice, ALWAYS send back an audio reply
+    if session.get("modality") == "voice" and text:
+        # Extract the raw response text (before WhatsApp formatting)
+        raw_text = text
+        
+        # Use the session's locked language
+        tts_lang = session.get("lang", "en")
+        
+        # Extract the layperson section for voice reply (most useful for illiterate users)
+        voice_text = raw_text
+        layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', raw_text, re.IGNORECASE)
+        if layperson_match:
+            voice_text = layperson_match.group(1).strip()
+        
+        # Retry TTS up to 2 times
+        for tts_attempt in range(2):
+            try:
+                import tempfile
+                os.makedirs("data/tmp", exist_ok=True)
+                audio_filename = f"voice_reply_{phone_number.replace('+', '')}_{uuid.uuid4().hex[:8]}.mp3"
+                audio_path = os.path.join("data/tmp", audio_filename)
+                tts_generator.text_to_indic_speech(voice_text, audio_path)
+                
+                # Serve via public URL for Twilio to fetch
+                public_url = os.getenv("PUBLIC_URL", "").strip()
+                if public_url:
+                    voice_dir = os.path.join("app", "static", "voice")
+                    os.makedirs(voice_dir, exist_ok=True)
+                    shutil.copy2(audio_path, os.path.join(voice_dir, audio_filename))
+                    audio_serve_url = f"{public_url}/static/voice/{audio_filename}"
+                    send_whatsapp_audio(to, audio_serve_url)
+                    logger.info(f"✓ Voice-to-voice reply sent to {to} in language '{tts_lang}'")
+                else:
+                    logger.warning("PUBLIC_URL not set. Cannot send voice reply via Twilio (requires public media URL).")
+                
+                # Clean up temp audio file
+                try:
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                except Exception:
+                    pass
+                break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning(f"Voice-to-voice reply generation attempt {tts_attempt + 1} failed: {e}")
+                if tts_attempt == 0:
+                    logger.info("Retrying TTS generation...")
+                else:
+                    logger.error(f"TTS failed after 2 attempts for {to}. Text reply was still sent.")
+
 def detect_text_language(text: str) -> str:
     """Detect the primary language of text based on Unicode character analysis."""
     if any(0x0D00 <= ord(c) <= 0x0D7F for c in text):
@@ -618,8 +685,13 @@ async def whatsapp_webhook(
 
     # 4. Invoke the pipeline and manage responses safely
     try:
-        result = pipeline.run(user_message, history=history, language=session.get("lang"))
+        # Pass slot_attempts from session for loop guard (Fix 2)
+        slot_attempts = session.get("slot_attempts", {})
+        result = pipeline.run(user_message, history=history, language=session.get("lang"), slot_attempts=slot_attempts)
         response_text = result["response_text"]
+        
+        # Persist updated slot_attempts back to session
+        session["slot_attempts"] = result.get("slot_attempts", slot_attempts)
         
         # CRITICAL: Never proceed with empty response — fallback
         if not response_text or not response_text.strip():
@@ -645,61 +717,10 @@ async def whatsapp_webhook(
             else:
                 download_url = f"http://localhost:8080{raw_url}"
 
-        # 6. ALWAYS send text reply FIRST (Twilio sandbox drops document-only messages)
-        send_whatsapp_text(From, whatsapp_reply)
-        
-        # 7. Then try sending document as bonus attachment
-        if download_url:
-            try:
-                caption = "📄 Formal Legal Notice (download)"
-                send_whatsapp_document(From, download_url, caption)
-            except Exception as doc_err:
-                logger.warning(f"Document send failed (text was already sent): {doc_err}")
-        
-        # 7. Voice-to-voice: If user modality is voice, also send back an audio reply
-        if session.get("modality") == "voice" and response_text:
-            try:
-                # Use the session's locked language
-                tts_lang = session.get("lang", "en")
-                
-                # Extract the layperson section for voice reply (most useful for illiterate users)
-                voice_text = response_text
-                layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', response_text, re.IGNORECASE)
-                if layperson_match:
-                    voice_text = layperson_match.group(1).strip()
-                
-                # Generate audio file
-                import tempfile
-                os.makedirs("data/tmp", exist_ok=True)
-                audio_filename = f"voice_reply_{phone_number.replace('+', '')}_{uuid.uuid4().hex[:8]}.mp3"
-                audio_path = os.path.join("data/tmp", audio_filename)
-                tts_generator.text_to_indic_speech(voice_text, audio_path)
-                
-                # Serve via public URL for Twilio to fetch
-                public_url = os.getenv("PUBLIC_URL", "").strip()
-                if public_url:
-                    # Serve the file from a static path
-                    audio_serve_url = f"{public_url}/static/voice/{audio_filename}"
-                    # Copy file to static/voice/ for serving
-                    voice_dir = os.path.join("app", "static", "voice")
-                    os.makedirs(voice_dir, exist_ok=True)
-                    import shutil
-                    shutil.copy2(audio_path, os.path.join(voice_dir, audio_filename))
-                    send_whatsapp_audio(From, audio_serve_url)
-                    logger.info(f"✓ Voice-to-voice reply sent to {From} in language '{tts_lang}'")
-                else:
-                    logger.warning("PUBLIC_URL not set. Cannot send voice reply via Twilio (requires public media URL).")
-                
-                # Clean up temp audio file
-                try:
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"Voice-to-voice reply generation failed (text reply was still sent): {e}")
+        # 6. Unified send: text + TTS audio (for voice) + document (if any)
+        send_whatsapp_response(From, whatsapp_reply, session, download_url=download_url)
 
-        # 8. Update and save session history
+        # 7. Update and save session history
         history.append({"role": "user", "text": user_message})
         history.append({"role": "assistant", "text": response_text})
         session["history"] = history
