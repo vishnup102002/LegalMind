@@ -733,7 +733,7 @@ async def whatsapp_webhook(
             "Sorry, the AI service is temporarily unavailable due to high demand. "
             "Please try again in 30 seconds."
         )
-        send_whatsapp_text(From, error_msg)
+        send_whatsapp_response(From, error_msg, session)
     except Exception as e:
         logger.error(f"Error processing pipeline run for {From}: {e}", exc_info=True)
         # Provide a specific error message based on the error type
@@ -748,7 +748,7 @@ async def whatsapp_webhook(
                 "ക്ഷമിക്കണം, സേവനം ഇപ്പോൾ തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
                 "Sorry, the service is currently busy. Please wait 30 seconds and try again."
             )
-        elif "connection" in error_str or "refused" in error_str:
+        elif "connection" in error_str or "refused" in error_str or "serviceunavailable" in error_str or "dns" in error_str:
             error_msg = (
                 "ക്ഷമിക്കണം, ഡാറ്റാബേസ് കണക്ഷൻ പ്രശ്നം.\n\n"
                 "Sorry, there is a database connection issue. Our team has been notified. Please try again later."
@@ -758,7 +758,7 @@ async def whatsapp_webhook(
                 "ക്ഷമിക്കണം, ഒരു അപ്രതീക്ഷിത പിശക് സംഭവിച്ചു.\n\n"
                 "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
             )
-        send_whatsapp_text(From, error_msg)
+        send_whatsapp_response(From, error_msg, session)
 
     return {"status": "ok"}
 

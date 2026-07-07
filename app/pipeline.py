@@ -117,6 +117,28 @@ MALAYALAM_TO_ENGLISH_CITIES = {
     "കാസർകോട്": "Kasaragod"
 }
 
+MALAYALAM_MONTHS = {
+    "ജനുവരി": "January",
+    "ഫെബ്രുവരി": "February",
+    "മാർച്ച്": "March",
+    "ഏപ്രിൽ": "April",
+    "മേയ്": "May",
+    "ജൂൺ": "June",
+    "ജൂലൈ": "July",
+    "ഓഗസ്റ്റ്": "August",
+    "സെപ്റ്റംബർ": "September",
+    "ഒക്ടോബർ": "October",
+    "നവംബർ": "November",
+    "ഡിസംബർ": "December"
+}
+
+def normalize_date_text(text: str) -> str:
+    if not text:
+        return text
+    for ml, en in MALAYALAM_MONTHS.items():
+        text = text.replace(ml, en)
+    return text
+
 # --- ISSUE-TYPE TO STATUTE HINTS (guide retrieval toward correct laws) ---
 ISSUE_TYPE_STATUTE_HINTS = {
     "ragging": {
@@ -404,6 +426,20 @@ class LegalMindPipeline:
                 t = (turn.get("text") or turn.get("response_text") or "").lower()
                 text_pool += " " + t
         
+        # Check Malayalam city names first to catch inflected forms (e.g. എറണാകുളത്ത്, കൊച്ചിയിൽ)
+        for ml_city, en_city in MALAYALAM_TO_ENGLISH_CITIES.items():
+            if ml_city in text_pool:
+                en_city_lower = en_city.lower()
+                if en_city_lower in CITY_TO_STATE:
+                    slots["jurisdiction"] = CITY_TO_STATE[en_city_lower]
+                    logger.info(f"Auto-resolved jurisdiction from Malayalam city '{ml_city}' → '{CITY_TO_STATE[en_city_lower]}'")
+                    req_fields = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+                    slots["slots_complete"] = all(
+                        slots.get(f) is not None and str(slots.get(f)).lower() != "null" and str(slots.get(f)).strip() != ""
+                        for f in req_fields
+                    )
+                    return slots
+        
         # Check each city against the text pool
         for city, state in CITY_TO_STATE.items():
             # Match whole word boundaries to avoid partial matches
@@ -487,13 +523,18 @@ Output ONLY valid JSON:
         seen_ids = set()
         all_qdrant_results = []
         for eq in expanded_queries:
-            query_vector = self.model.encode(eq).tolist()
-            results = self.vector_store.hybrid_search(
-                query_vector=query_vector,
-                query_text=eq,
-                top_k=5,
-                jurisdiction=jurisdiction
-            )
+            try:
+                query_vector = self.model.encode(eq).tolist()
+                results = self.vector_store.hybrid_search(
+                    query_vector=query_vector,
+                    query_text=eq,
+                    top_k=5,
+                    jurisdiction=jurisdiction
+                )
+            except Exception as e:
+                logger.error(f"Vector hybrid search failed for query '{eq}': {e}", exc_info=True)
+                results = []
+                
             logger.info(f"Query '{eq[:30]}' returned {len(results)} matches.")
             for r in results[:2]:
                 logger.info(f"   Match: {r.get('citation')}, score: {r.get('score')}, type: {r.get('type')}")
@@ -516,7 +557,11 @@ Output ONLY valid JSON:
             else:
                 db_sec_id = str(db_sec_id)
             
-            graph_data = self.graph_store.get_related_provisions(db_sec_id)
+            try:
+                graph_data = self.graph_store.get_related_provisions(db_sec_id)
+            except Exception as e:
+                logger.error(f"Neo4j graph query failed for section '{db_sec_id}': {e}", exc_info=True)
+                graph_data = None
             
             context_entry = {
                 "id": doc["id"],
@@ -1070,6 +1115,9 @@ LANGUAGE HANDLING — CRITICAL:
 - Do NOT return null for incident_description if the user clearly described a problem, even if the entire text is in Malayalam.
 - Translate Malayalam content to English for the JSON field values.
 - Common Malayalam legal terms: ശമ്പളം/വേതനം = salary/wages, ഒഴിപ്പിക്കൽ/കുടിയിറക്കൽ = eviction, റാഗിങ് = ragging, വീട്ടുടമ = landlord, കോളേജ് = college, പോലീസ് = police, കമ്പനി = company.
+- Kerala district/city names in Malayalam and their English equivalents:
+  എറണാകുളം = Ernakulam, കൊച്ചി = Kochi, തിരുവനന്തപുരം = Thiruvananthapuram, കോഴിക്കോട് = Kozhikode, തൃശൂർ/തൃശ്ശൂർ = Thrissur, കൊല്ലം = Kollam, മലപ്പുറം = Malappuram, കണ്ണൂർ = Kannur, പാലക്കാട് = Palakkad, ആലപ്പുഴ = Alappuzha, കോട്ടയം = Kottayam, ഇടുക്കി = Idukki, വയനാട് = Wayanad, പത്തനംതിട്ട = Pathanamthitta, കാസർഗോഡ്/കാസർകോട് = Kasaragod.
+- The user may use grammatical suffixes for locations (e.g. എറണാകുളത്ത്, എറണാകുളത്താണ്, കൊച്ചിയിൽ). Extract the clean base city/district name in English (e.g. "Ernakulam" or "Kochi") as the "jurisdiction".
 
 CRITICAL RULES:
 - Do NOT hallucinate. Do NOT invent details.
@@ -1092,7 +1140,7 @@ Current local date: {current_date_str}
 Please output a JSON object containing the values of the following slots based strictly on the conversation:
 - "issue_type": Must be one of "ragging", "eviction", "wage_theft", "consumer", "other", or null.
 - "incident_date": The date of the incident (YYYY-MM-DD) or null. If the user mentions a relative date like "yesterday" or "ഇന്നലെ", resolve it relative to the current local date ({current_date_str}) to a YYYY-MM-DD format. Otherwise, if no date/time is mentioned, return null.
-- "jurisdiction": The Indian state name where the incident occurred, or null. Translate Malayalam place names to English (e.g., എറണാകുളം = Ernakulam, കൊച്ചി = Kochi).
+- "jurisdiction": The Indian state name where the incident occurred, or null. Translate Malayalam place names to English (e.g., എറണാകുളം = Ernakulam, കൊച്ചി = Kochi) and map them to their corresponding Indian state in English (e.g. Ernakulam/Kochi/Ernakulamത്താണ്/കൊച്ചിയിൽ resolve to state "kerala").
 - "institution": The name of the college, company, school, or landlord's building mentioned, or null.
 - "incident_description": A brief one-sentence English summary of the incident as described by the user, or null. If the user described the incident in Malayalam, translate and summarize it in English here.
 - "parties_mentioned": A list of names of specific individuals involved (excluding generic terms like 'sender' or 'recipient'), or [].
@@ -1402,7 +1450,14 @@ Output format:
         for ml_city, en_city in MALAYALAM_TO_ENGLISH_CITIES.items():
             query = query.replace(ml_city, en_city)
             
+        # Map Malayalam months to English to prevent date parser failures
+        query = normalize_date_text(query)
+            
         session_slots = self._call_slot_extractor(query, history)
+        
+        # Double check date normalization on extracted value
+        if session_slots.get("incident_date"):
+            session_slots["incident_date"] = normalize_date_text(str(session_slots["incident_date"]))
         
         # Detect language from query if not provided
         if language:
