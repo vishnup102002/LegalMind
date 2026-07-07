@@ -1,0 +1,33 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/LegalMind
+            git fetch origin main
+            git reset --hard origin/main
+            sudo systemctl restart legalmind
+            
+            # Wait for service to start and verify
+            sleep 5
+            if sudo systemctl is-active --quiet legalmind; then
+              echo "✓ LegalMind service restarted successfully"
+            else
+              echo "✗ LegalMind service failed to start!"
+              sudo journalctl -u legalmind --no-pager -n 20
+              exit 1
+            fi
