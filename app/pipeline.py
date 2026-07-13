@@ -1393,8 +1393,9 @@ Output format:
             "recipient_name": None
         }
 
-    def generate_notice_document_file(self, draft: str, sender: str, recipient: str) -> str:
-        """Helper to compile and save drafted legal notice to PDF/TXT."""
+    def generate_notice_document_file(self, draft: str, sender: str, recipient: str, language: str = "en") -> str:
+        """Helper to compile and save drafted legal notice to PDF/TXT.
+        Supports bilingual PDF generation — Malayalam or English template labels."""
         import os
         output_dir = "data/synthesis"
         os.makedirs(output_dir, exist_ok=True)
@@ -1402,6 +1403,20 @@ Output format:
         
         from datetime import date
         notice_date = date.today().strftime("%d %B %Y")
+        
+        # Bilingual template labels
+        if language == "ml":
+            header_title = "ഔദ്യോഗിക നിയമ നോട്ടീസ്"
+            date_label = "തീയതി"
+            from_label = "അയക്കുന്നയാൾ"
+            to_label = "സ്വീകരിക്കുന്നയാൾ"
+            sig_label = f"ഒപ്പ് ({sender})"
+        else:
+            header_title = "FORMAL LEGAL NOTICE"
+            date_label = "Date"
+            from_label = "From (Sender)"
+            to_label = "To (Recipient)"
+            sig_label = f"Signature ({sender})"
         
         html_content = f"""
         <html>
@@ -1415,18 +1430,18 @@ Output format:
             </style>
         </head>
         <body>
-            <div class="header">FORMAL LEGAL NOTICE</div>
+            <div class="header">{header_title}</div>
             <div class="meta">
-                <p><strong>Date:</strong> {notice_date}</p>
-                <p><strong>From (Sender):</strong> {sender}</p>
-                <p><strong>To (Recipient):</strong> {recipient}</p>
+                <p><strong>{date_label}:</strong> {notice_date}</p>
+                <p><strong>{from_label}:</strong> {sender}</p>
+                <p><strong>{to_label}:</strong> {recipient}</p>
             </div>
             <div class="content">
 {draft}
             </div>
             <div class="signature">
                 <p>_________________________</p>
-                <p>Signature ({sender})</p>
+                <p>{sig_label}</p>
             </div>
         </body>
         </html>
@@ -1716,16 +1731,31 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     from datetime import date
                     notice_date = date.today().strftime("%d %B %Y")
                     
+                    # Determine notice language — Malayalam or English
+                    notice_lang_instruction = ""
+                    if detected_lang == "ml":
+                        notice_lang_instruction = (
+                            "\nLANGUAGE INSTRUCTION: Draft the entire legal notice in MALAYALAM (മലയാളം). "
+                            "All section headers, facts, legal violations, demands, and signature block must be in Malayalam. "
+                            "Legal statute names can remain in English (as they are officially in English). "
+                            "Use formal Malayalam legal register.\n"
+                        )
+                    else:
+                        notice_lang_instruction = "\nLANGUAGE INSTRUCTION: Draft the entire legal notice in ENGLISH. Use formal English legal register.\n"
+                    
+                    # Placeholder text in session language
+                    placeholder_text = "[അയക്കുന്നയാൾ പൂരിപ്പിക്കേണ്ടതാണ്]" if detected_lang == "ml" else "[TO BE FILLED BY SENDER]"
+                    
                     draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
 
 Your task is to draft a FORMAL LEGAL NOTICE — a structured 
 official document used to assert legal rights and demand remedy.
 This is NOT a threatening letter. It is a legally recognized 
 document used in Indian courts and institutions.
-
+{notice_lang_instruction}
 CRITICAL RULES:
 - Use ONLY the information provided below.
-- If any field (such as address) is NOT provided, write "[TO BE FILLED BY SENDER]" as a placeholder.
+- If any field (such as address) is NOT provided, write "{placeholder_text}" as a placeholder.
 - NEVER invent, assume, or fabricate addresses, phone numbers, or any personal details.
 - The date of this notice is: {notice_date}
 
@@ -1736,9 +1766,9 @@ Gathered facts:
 - Jurisdiction: {session_slots.get('jurisdiction')}
 - Incident description: {session_slots.get('incident_description')}
 - Sender (complainant): {sender_name}
-- Sender address: [TO BE FILLED BY SENDER]
+- Sender address: {placeholder_text}
 - Recipient (respondent): {recipient_name}
-- Recipient address: [TO BE FILLED BY SENDER]
+- Recipient address: {placeholder_text}
 
 Applicable law from assessment: {statutes_cited}
 
@@ -1751,14 +1781,13 @@ Draft a formal legal notice with these sections:
 6. Consequence of non-compliance (legal action, not personal threat)
 7. Signature block
 
-Language: formal, objective, third-person where appropriate.
 DO NOT include threats of physical harm.
 DO NOT add any content not in the gathered facts.
-DO NOT invent addresses — use [TO BE FILLED BY SENDER] for any unknown address.
+DO NOT invent addresses — use {placeholder_text} for any unknown address.
 DO NOT quote or fabricate statute text verbatim — describe violations in your own words.
 DO NOT refuse to draft this — it is a civil legal document."""
                     draft = self._call_ollama_api(draft_prompt, temperature=0.3)
-                    download_url = self.generate_notice_document_file(draft, sender_name, recipient_name)
+                    download_url = self.generate_notice_document_file(draft, sender_name, recipient_name, language=detected_lang)
                     generated_text = (
                         f"### DRAFT FORMAL LEGAL NOTICE\n\n"
                         f"**Sender:** {sender_name}\n"
@@ -1825,7 +1854,9 @@ Do not include any notes, prefixes, or intros. Only return the response."""
             "response_text": final_response_text,
             "faithfulness_score": final_faithfulness,
             "context": retrieved_context_text,
-            "slot_attempts": getattr(self, '_last_slot_attempts', {})
+            "slot_attempts": getattr(self, '_last_slot_attempts', {}),
+            "sender_name": session_slots.get("sender_name"),
+            "recipient_name": session_slots.get("recipient_name")
         }
 
 if __name__ == "__main__":

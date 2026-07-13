@@ -507,72 +507,93 @@ def send_whatsapp_audio(to: str, media_url: str, caption: str = ""):
     except Exception as e:
         logger.error(f"Failed to send WhatsApp audio to {to}: {e}")
 
+def get_pdf_instructions_note(lang: str, sender: str, recipient: str) -> str:
+    """Generate a clean, friendly instruction guide on what to do with the notice PDF."""
+    sender = sender or "Vishnu"
+    recipient = recipient or "RC Company"
+    if lang == "ml":
+        return (
+            f"നിങ്ങളുടെ ഔദ്യോഗിക നിയമ നോട്ടീസ് ഇതോടൊപ്പം PDF ആയി അയച്ചിട്ടുണ്ട്. നിങ്ങൾ ചെയ്യേണ്ടത്:\n\n"
+            f"1. ഈ PDF ഡൗൺലോഡ് ചെയ്ത് പ്രിന്റ് എടുക്കുക.\n"
+            f"2. {sender} എന്ന പേരിന് മുകളിലായി ഒപ്പ് രേഖപ്പെടുത്തുക.\n"
+            f"3. ഇത് രജിസ്റ്റർ ചെയ്ത തപാൽ (Registered Post) വഴിയോ നേരിട്ടോ എതിർകക്ഷിയായ {recipient}-ന് അയക്കുക."
+        )
+    else:
+        return (
+            f"Your formal legal notice has been generated and attached as a PDF. Here is what you should do next:\n\n"
+            f"1. Download and print the PDF.\n"
+            f"2. Sign the document above your name ({sender}).\n"
+            f"3. Send it to the recipient ({recipient}) via Registered Post or deliver it directly."
+        )
+
 def send_whatsapp_response(to: str, text: str, session: dict, download_url: str = None):
-    """Unified response sender. Always sends text, then TTS audio for voice sessions,
-    then document attachment if present. This ensures voice users ALWAYS get audio replies."""
+    """Unified response sender. Separates voice and text modalities:
+    - If user modality is voice: sends ONLY TTS audio (no text), plus document attachment if present.
+    - If user modality is text: sends ONLY text, plus document attachment if present."""
     import shutil
     
     phone_number = to.replace("whatsapp:", "")
+    is_voice = (session.get("modality") == "voice")
     
-    # 1. ALWAYS send text first (Twilio sandbox drops document-only messages)
-    send_whatsapp_text(to, text)
-    
-    # 2. Send document attachment if present
+    # 1. Send document attachment first if present
     if download_url:
         try:
-            caption = "📄 Formal Legal Notice (download)"
+            caption = "📄 Formal Legal Notice"
             send_whatsapp_document(to, download_url, caption)
         except Exception as doc_err:
-            logger.warning(f"Document send failed (text was already sent): {doc_err}")
-    
-    # 3. Voice-to-voice: If user modality is voice, ALWAYS send back an audio reply
-    if session.get("modality") == "voice" and text:
-        # Extract the raw response text (before WhatsApp formatting)
-        raw_text = text
-        
-        # Use the session's locked language
-        tts_lang = session.get("lang", "en")
-        
-        # Extract the layperson section for voice reply (most useful for illiterate users)
-        voice_text = raw_text
-        layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', raw_text, re.IGNORECASE)
-        if layperson_match:
-            voice_text = layperson_match.group(1).strip()
-        
-        # Retry TTS up to 2 times
-        for tts_attempt in range(2):
-            try:
-                import tempfile
-                os.makedirs("data/tmp", exist_ok=True)
-                audio_filename = f"voice_reply_{phone_number.replace('+', '')}_{uuid.uuid4().hex[:8]}.mp3"
-                audio_path = os.path.join("data/tmp", audio_filename)
-                tts_generator.text_to_indic_speech(voice_text, audio_path)
-                
-                # Serve via public URL for Twilio to fetch
-                public_url = os.getenv("PUBLIC_URL", "").strip()
-                if public_url:
-                    voice_dir = os.path.join("app", "static", "voice")
-                    os.makedirs(voice_dir, exist_ok=True)
-                    shutil.copy2(audio_path, os.path.join(voice_dir, audio_filename))
-                    audio_serve_url = f"{public_url}/static/voice/{audio_filename}"
-                    send_whatsapp_audio(to, audio_serve_url)
-                    logger.info(f"✓ Voice-to-voice reply sent to {to} in language '{tts_lang}'")
-                else:
-                    logger.warning("PUBLIC_URL not set. Cannot send voice reply via Twilio (requires public media URL).")
-                
-                # Clean up temp audio file
+            logger.warning(f"Document send failed: {doc_err}")
+            
+    # 2. Handle reply content based on modality
+    if is_voice:
+        # Voice modality: generate and send TTS audio ONLY (no text)
+        if text:
+            # Use the session's locked language
+            tts_lang = session.get("lang", "en")
+            
+            # Extract the layperson section for voice reply if present, otherwise send the whole text
+            voice_text = text
+            layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+            if layperson_match:
+                voice_text = layperson_match.group(1).strip()
+            
+            # Retry TTS up to 2 times
+            for tts_attempt in range(2):
                 try:
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
-                except Exception:
-                    pass
-                break  # Success, exit retry loop
-            except Exception as e:
-                logger.warning(f"Voice-to-voice reply generation attempt {tts_attempt + 1} failed: {e}")
-                if tts_attempt == 0:
-                    logger.info("Retrying TTS generation...")
-                else:
-                    logger.error(f"TTS failed after 2 attempts for {to}. Text reply was still sent.")
+                    import tempfile
+                    os.makedirs("data/tmp", exist_ok=True)
+                    audio_filename = f"voice_reply_{phone_number.replace('+', '')}_{uuid.uuid4().hex[:8]}.mp3"
+                    audio_path = os.path.join("data/tmp", audio_filename)
+                    tts_generator.text_to_indic_speech(voice_text, audio_path)
+                    
+                    # Serve via public URL for Twilio to fetch
+                    public_url = os.getenv("PUBLIC_URL", "").strip()
+                    if public_url:
+                        voice_dir = os.path.join("app", "static", "voice")
+                        os.makedirs(voice_dir, exist_ok=True)
+                        shutil.copy2(audio_path, os.path.join(voice_dir, audio_filename))
+                        audio_serve_url = f"{public_url}/static/voice/{audio_filename}"
+                        send_whatsapp_audio(to, audio_serve_url)
+                        logger.info(f"✓ Voice-to-voice reply sent to {to} in language '{tts_lang}'")
+                    else:
+                        logger.warning("PUBLIC_URL not set. Cannot send voice reply via Twilio (requires public media URL).")
+                    
+                    # Clean up temp audio file
+                    try:
+                        if os.path.exists(audio_path):
+                            os.remove(audio_path)
+                    except Exception:
+                        pass
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    logger.warning(f"Voice-to-voice reply generation attempt {tts_attempt + 1} failed: {e}")
+                    if tts_attempt == 0:
+                        logger.info("Retrying TTS generation...")
+                    else:
+                        logger.error(f"TTS failed after 2 attempts for {to}.")
+    else:
+        # Text modality: send text ONLY (no audio)
+        if text:
+            send_whatsapp_text(to, text)
 
 def detect_text_language(text: str) -> str:
     """Detect the primary language of text based on Unicode character analysis."""
@@ -603,13 +624,6 @@ async def whatsapp_webhook(
     user_message = Body.strip()
     is_voice_input = False
     detected_input_lang = "en"
-    
-    # Detect language from text input (Unicode analysis)
-    if user_message and not is_voice_input:
-        if any(0x0D00 <= ord(c) <= 0x0D7F for c in user_message):
-            detected_input_lang = "ml"
-        else:
-            detected_input_lang = "en"
     
     # 1. Voice note transcription support
     try:
@@ -660,6 +674,15 @@ async def whatsapp_webhook(
             logger.warning("Twilio credentials missing. Cannot download WhatsApp media.")
             user_message = "Voice message received but Twilio credentials missing on server."
  
+    # Detect language from text (either direct text input or transcribed voice note)
+    if user_message:
+        if any(0x0D00 <= ord(c) <= 0x0D7F for c in user_message) or any(0x0B80 <= ord(c) <= 0x0BFF for c in user_message):
+            detected_input_lang = "ml"
+        elif is_voice_input:
+            pass
+        else:
+            detected_input_lang = "en"
+
     # 2. Reset session command check
     if user_message.lower() in ["/reset", "reset", "clear"]:
         session_manager.clear(phone_number)
@@ -669,17 +692,18 @@ async def whatsapp_webhook(
  
     # 3. Load session history (session loaded early at start)
     
-    # CRITICAL FIX: Set language on session start and STICK to it.
-    # If first input is voice and detected as Malayalam, lock to Malayalam.
+    # STRICT language locking: lock on the FIRST message only, never change after that
     if "lang" not in session:
         session["lang"] = detected_input_lang
-        logger.info(f"Session language locked to '{detected_input_lang}' for {phone_number}")
+        logger.info(f"Session language LOCKED to '{detected_input_lang}' for {phone_number} (first message)")
         
-    # Bug 3 Fix: Track user modality and stick to it
-    if is_voice_input:
-        session["modality"] = "voice"
-    elif "modality" not in session:
-        session["modality"] = "text"
+    # STRICT modality locking: lock on the FIRST message only, never change after that
+    if "modality" not in session:
+        if is_voice_input:
+            session["modality"] = "voice"
+        else:
+            session["modality"] = "text"
+        logger.info(f"Session modality LOCKED to '{session['modality']}' for {phone_number} (first message)")
         
     history = session.get("history", [])
 
@@ -716,6 +740,11 @@ async def whatsapp_webhook(
                 download_url = f"{public_url}{raw_url}"
             else:
                 download_url = f"http://localhost:8080{raw_url}"
+                
+            # Replace the long draft text with a clean instructions note (using LLM-extracted names)
+            sender_name = result.get("sender_name")
+            recipient_name = result.get("recipient_name")
+            whatsapp_reply = get_pdf_instructions_note(session.get("lang", "en"), sender_name, recipient_name)
 
         # 6. Unified send: text + TTS audio (for voice) + document (if any)
         send_whatsapp_response(From, whatsapp_reply, session, download_url=download_url)
@@ -728,36 +757,36 @@ async def whatsapp_webhook(
         
     except LLMUnavailableError:
         logger.error(f"LLM backends unreachable for {From}", exc_info=True)
-        error_msg = (
-            "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
-            "Sorry, the AI service is temporarily unavailable due to high demand. "
-            "Please try again in 30 seconds."
-        )
+        if session.get("lang") == "ml":
+            error_msg = "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
+        else:
+            error_msg = "Sorry, the AI service is temporarily unavailable due to high demand. Please try again in 30 seconds."
         send_whatsapp_response(From, error_msg, session)
     except Exception as e:
         logger.error(f"Error processing pipeline run for {From}: {e}", exc_info=True)
-        # Provide a specific error message based on the error type
+        # Provide a specific error message in SESSION LANGUAGE ONLY
         error_str = str(e).lower()
+        is_ml = session.get("lang") == "ml"
         if "timeout" in error_str or "timed out" in error_str:
-            error_msg = (
-                "ക്ഷമിക്കണം, സെർവർ പ്രതികരണം സമയപരിധി കഴിഞ്ഞു.\n\n"
-                "Sorry, the server response timed out. Please send your message again."
-            )
+            if is_ml:
+                error_msg = "ക്ഷമിക്കണം, സെർവർ പ്രതികരണം സമയപരിധി കഴിഞ്ഞു. ദയവായി വീണ്ടും ശ്രമിക്കുക."
+            else:
+                error_msg = "Sorry, the server response timed out. Please send your message again."
         elif "rate" in error_str or "429" in error_str or "limit" in error_str:
-            error_msg = (
-                "ക്ഷമിക്കണം, സേവനം ഇപ്പോൾ തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n"
-                "Sorry, the service is currently busy. Please wait 30 seconds and try again."
-            )
+            if is_ml:
+                error_msg = "ക്ഷമിക്കണം, സേവനം ഇപ്പോൾ തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
+            else:
+                error_msg = "Sorry, the service is currently busy. Please wait 30 seconds and try again."
         elif "connection" in error_str or "refused" in error_str or "serviceunavailable" in error_str or "dns" in error_str:
-            error_msg = (
-                "ക്ഷമിക്കണം, ഡാറ്റാബേസ് കണക്ഷൻ പ്രശ്നം.\n\n"
-                "Sorry, there is a database connection issue. Our team has been notified. Please try again later."
-            )
+            if is_ml:
+                error_msg = "ക്ഷമിക്കണം, ഡാറ്റാബേസ് കണക്ഷൻ പ്രശ്നം. ദയവായി പിന്നീട് ശ്രമിക്കുക."
+            else:
+                error_msg = "Sorry, there is a database connection issue. Our team has been notified. Please try again later."
         else:
-            error_msg = (
-                "ക്ഷമിക്കണം, ഒരു അപ്രതീക്ഷിത പിശക് സംഭവിച്ചു.\n\n"
-                "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
-            )
+            if is_ml:
+                error_msg = "ക്ഷമിക്കണം, ഒരു അപ്രതീക്ഷിത പിശക് സംഭവിച്ചു. ദയവായി വീണ്ടും ശ്രമിക്കുക അല്ലെങ്കിൽ /reset അയക്കുക."
+            else:
+                error_msg = "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
         send_whatsapp_response(From, error_msg, session)
 
     return {"status": "ok"}
