@@ -261,16 +261,28 @@ class LegalMindPipeline:
 
         # --- HARD PYTHON VALIDATION GATE ---
         missing_fields = []
+        GENERIC_PLACEHOLDERS = {
+            "", "null", "none", "unknown", "undefined", "placeholder",
+            "to be filled by sender", "sender name", "recipient name",
+            "landlord", "hr", "you", "me", "i", "user", "client", "complainant",
+            "respondent", "company", "employer", "employee", "tenant",
+            "party", "opponent", "boss", "owner", "management", "opposing party",
+            "the sender", "the recipient", "the employer", "the company", "the landlord",
+            # Malayalam generic pronouns & placeholders
+            "ഞാൻ", "എനിക്ക്", "എന്റെ", "നിങ്ങൾ", "കമ്പനി", "തൊഴിലുടമ", "തൊഴിലാളി",
+            "വീട്ടുടമസ്ഥൻ", "വാടകക്കാരൻ", "എതിർകക്ഷി", "അയക്കുന്നയാൾ", "ലഭിക്കേണ്ടയാൾ"
+        }
+
         def is_invalid(val):
             if not val:
                 return True
             clean = str(val).strip().lower()
-            return clean in ["", "null", "none", "unknown", "undefined", "placeholder", "to be filled by sender", "sender name", "recipient name", "landlord", "hr"]
+            return clean in GENERIC_PLACEHOLDERS or len(clean) < 2
 
         if is_invalid(sender_name):
-            missing_fields.append("Sender full name (the person sending the notice)")
+            missing_fields.append("Sender full name (e.g. 'Vishnu P')")
         if is_invalid(recipient_name):
-            missing_fields.append("Recipient full name or organization name")
+            missing_fields.append("Recipient full name or organization name (e.g. 'TechCorp Pvt Ltd')")
         if is_invalid(issue_summary):
             missing_fields.append("Brief description of the incident/issue")
 
@@ -315,6 +327,12 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         except Exception as e:
             logger.error(f"Failed to generate notice draft text: {e}")
             draft = f"FORMAL LEGAL NOTICE\n\nTo: {recipient_name}\nFrom: {sender_name}\n\nSubject: DEMAND FOR REMEDIAL ACTION\n\n1. Facts: {issue_summary}\n2. Statutory Ground: {statutes_cited}"
+
+        # Reject broken/corrupted draft text containing empty brackets or minimal words
+        bracket_count = draft.count("[ ]") + draft.count(". .")
+        if len(draft.strip()) < 80 or bracket_count > 3:
+            logger.warning(f"Draft text quality check failed (bracket_count={bracket_count}, length={len(draft)}). Aborting PDF compilation.")
+            return "TOOL ERROR: Could not generate a clean legal notice draft due to incomplete information. Ask the user to provide their full legal name and the recipient's full legal name."
 
         # Generate PDF file with thread-safe unique UUID filename
         download_url = self.generate_notice_document_file(draft, sender_name, recipient_name, language=language, phone=phone)

@@ -509,21 +509,23 @@ def send_whatsapp_audio(to: str, media_url: str, caption: str = ""):
 
 def get_pdf_instructions_note(lang: str, sender: str, recipient: str) -> str:
     """Generate a clean, friendly instruction guide on what to do with the notice PDF."""
-    sender = sender or "Vishnu"
-    recipient = recipient or "RC Company"
     if lang == "ml":
+        s_display = sender if sender and len(sender) > 1 else "നിങ്ങളുടെ പേര്"
+        r_display = recipient if recipient and len(recipient) > 1 else "എതിർകക്ഷി"
         return (
             f"നിങ്ങളുടെ ഔദ്യോഗിക നിയമ നോട്ടീസ് ഇതോടൊപ്പം PDF ആയി അയച്ചിട്ടുണ്ട്. നിങ്ങൾ ചെയ്യേണ്ടത്:\n\n"
             f"1. ഈ PDF ഡൗൺലോഡ് ചെയ്ത് പ്രിന്റ് എടുക്കുക.\n"
-            f"2. {sender} എന്ന പേരിന് മുകളിലായി ഒപ്പ് രേഖപ്പെടുത്തുക.\n"
-            f"3. ഇത് രജിസ്റ്റർ ചെയ്ത തപാൽ (Registered Post) വഴിയോ നേരിട്ടോ എതിർകക്ഷിയായ {recipient}-ന് അയക്കുക."
+            f"2. {s_display} എന്ന പേരിന് മുകളിലായി ഒപ്പ് രേഖപ്പെടുത്തുക.\n"
+            f"3. ഇത് രജിസ്റ്റർ ചെയ്ത തപാൽ (Registered Post) വഴിയോ നേരിട്ടോ എതിർകക്ഷിയായ {r_display}-ന് അയക്കുക."
         )
     else:
+        s_display = sender if sender and len(sender) > 1 else "your name"
+        r_display = recipient if recipient and len(recipient) > 1 else "the recipient"
         return (
             f"Your formal legal notice has been generated and attached as a PDF. Here is what you should do next:\n\n"
             f"1. Download and print the PDF.\n"
-            f"2. Sign the document above your name ({sender}).\n"
-            f"3. Send it to the recipient ({recipient}) via Registered Post or deliver it directly."
+            f"2. Sign the document above {s_display}.\n"
+            f"3. Send it to {r_display} via Registered Post or deliver it directly."
         )
 
 def send_whatsapp_response(to: str, text: str, session: dict, modality: str = "text", download_url: str = None):
