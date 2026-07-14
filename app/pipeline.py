@@ -976,7 +976,9 @@ Output ONLY valid JSON:
                     "You are a professional legal assistant. Analyze the user query and the retrieved legal context to create a detailed legal assessment and a layperson action guide.\n\n"
                     f"User Query: {state['user_query']}\n"
                     f"Retrieved Legal Context (Citation: {citation}):\n{text}\n\n"
-                    "CRITICAL SAFETY WARNINGS:\n"
+                    "CRITICAL SAFETY & FACT ACCURACY WARNINGS:\n"
+                    "- Preserve all specific facts, dates, durations, and numbers mentioned by the user (e.g. if user states 3 months or since January 2026, keep '3 months' / 'January 2026').\n"
+                    "- NEVER replace the user's reported duration (e.g. 3 months) with statutory timeframe numbers (e.g. 20 days or 7 days) from the retrieved text.\n"
                     "- The 'RULE' section MUST be based strictly and directly on the provided Retrieved Legal Context.\n"
                     "- Do NOT make up, assume, or fabricate any statutory language or sections (e.g. do not invent section text or state that a section contains a rule that is not in the text).\n"
                     "- If the Retrieved Legal Context is just a short title/extent clause, do NOT invent details of other substantive sections that are not in the context.\n"
@@ -1944,7 +1946,8 @@ Use EXACTLY these natural phrasing styles:
                 except Exception:
                     generated_text = self._get_hardcoded_fallback("SLOT_FILLING", detected_lang, missing)
             elif expected_state in ["RAG_RETRIEVE", "NOTICE_OFFER"]:
-                search_query = session_slots["incident_description"] if session_slots["incident_description"] else query
+                summary_desc = session_slots.get("incident_description")
+                search_query = f"{query} ({summary_desc})" if summary_desc and summary_desc.lower() != query.lower() else query
                 initial_state = {
                     "user_query": search_query,
                     "detected_language": detected_lang,
