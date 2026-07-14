@@ -12,6 +12,7 @@ Tests the Dynamic Tool-Calling ReAct Agent Architecture across multiple scenario
 import sys
 import os
 import logging
+import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ def run_verification():
     print("\n[TEST 1] Malayalam Intake -> Notice PDF Flow")
     history_1 = []
     
+    time.sleep(2)
     # Turn 1: Malayalam query
     q1 = "ഞാൻ കൊച്ചിയിൽ ഒരു കമ്പനിയിൽ ജോലി ചെയ്യുന്നു. അവർ 3 മാസമായി ശമ്പളം തന്നിട്ടില്ല. 2026 ജനുവരി മുതൽ ഒരു രൂപ പോലും കിട്ടിയില്ല."
     res1 = pipeline.run(q1, history=history_1, language="ml", phone="+919876543210")
@@ -46,8 +48,9 @@ def run_verification():
     history_1.append({"role": "user", "text": q1})
     history_1.append({"role": "assistant", "text": res1["response_text"]})
     
+    time.sleep(2)
     # Turn 2: User provides names for notice as free-text copied template
-    q2 = "സെന്റർ നാമം നൽകുക: vishnu\nറിസീവർ നാമം നൽകുക: wex company hr"
+    q2 = "അതെ, ഒരു ലീഗൽ നോട്ടീസ് തയ്യാറാക്കണം. അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr"
     res2 = pipeline.run(q2, history=history_1, language="ml", phone="+919876543210")
     print("Turn 2 Status:", res2["status"])
     print("Turn 2 Response Preview:\n", res2["response_text"][:250], "...\n")

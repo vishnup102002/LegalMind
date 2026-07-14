@@ -111,28 +111,28 @@ AGENT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "draft_legal_notice",
-            "description": "Compiles a formal PDF legal notice document for the user. ALWAYS ensure you have the full name of BOTH the Sender (the client) AND the Recipient (opposing party/employer/landlord) before executing this tool.",
+            "description": "Compiles a formal PDF legal notice document for the user. ALWAYS call this tool immediately whenever the user provides names (e.g. 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr' or 'sender: vishnu, recipient: wex company hr'). Extract sender_name and recipient_name dynamically from Malayalam or English text.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "sender_name": {
                         "type": "string",
-                        "description": "Full name of the person sending the notice / complainant."
+                        "description": "Full name of the person sending the notice / complainant (e.g. vishnu, അയക്കുന്നയാൾ)."
                     },
                     "recipient_name": {
                         "type": "string",
-                        "description": "Full name or company name of the recipient receiving the notice."
+                        "description": "Full name or company name of the recipient receiving the notice (e.g. wex company hr, ലഭിക്കേണ്ടയാൾ)."
                     },
                     "issue_summary": {
                         "type": "string",
-                        "description": "Brief summary of facts, dates, and incident details."
+                        "description": "Brief summary of facts, dates, and incident details from conversation history."
                     },
                     "statutes_cited": {
                         "type": "string",
                         "description": "Names of applicable statutes or acts discussed in legal assessment."
                     }
                 },
-                "required": ["sender_name", "recipient_name", "issue_summary"]
+                "required": ["sender_name", "recipient_name"]
             }
         }
     }
@@ -186,23 +186,24 @@ class LegalMindPipeline:
                     logger.info(f"Auto-resolved jurisdiction state '{state}' from city '{city}'")
                     break
 
-        # --- BUG 1 FIX: Dynamic LLM/Translation alignment for Malayalam -> English Qdrant Vector Search ---
-        search_query_english = query
+        # --- BUG 1 FIX: Dynamic LLM semantic query formulation for Qdrant Vector & Neo4j Graph Search ---
+        search_query_text = query
         if any(ord(c) > 127 for c in query):
             try:
                 if hasattr(self, 'translator') and self.translator:
                     inputs = self.translation_tokenizer(query, return_tensors="pt", padding=True, truncation=True)
                     translated = self.translation_model.generate(**inputs)
-                    search_query_english = self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
+                    translated_str = self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
+                    search_query_text = f"{translated_str} {jurisdiction or ''}".strip()
                 else:
-                    tr_prompt = f"Translate the following legal problem into 1 simple, concise English search string for legal database retrieval: {query}"
-                    search_query_english = self._call_llm_raw("You are a legal search query translator.", [{"role": "user", "content": tr_prompt}], temperature=0.0)
+                    tr_prompt = f"Formulate a 1-sentence English semantic search query for Indian statutes & case precedents matching this user incident (e.g. consumer rights, cheque bounce, cybercrime, employment, tenancy, contract breach): {query}"
+                    search_query_text = self._call_llm_raw("You are a expert legal search query formulation system.", [{"role": "user", "content": tr_prompt}], temperature=0.0)
             except Exception as e:
-                logger.warning(f"Query pre-translation fallback to raw query: {e}")
+                logger.warning(f"Query formulation fallback to raw query: {e}")
+        else:
+            search_query_text = f"{query} {jurisdiction or ''}".strip()
 
-        # Domain keyword expansion to ensure semantic alignment with English labor/civil/housing statutes
-        search_query_text = f"{search_query_english} {jurisdiction or ''} labor employment law wages non payment salary compensation tenant eviction rental easement".strip()
-        logger.info(f"Vector Retrieval Query Enriched: '{search_query_text}'")
+        logger.info(f"Vector Retrieval Query Dynamically Formulated: '{search_query_text}'")
 
         try:
             query_vector = self.model.encode(search_query_text).tolist()
@@ -543,6 +544,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                             language=language,
                             phone=phone
                         )
+                        retrieved_context += "\n\n" + tool_result
                     else:
                         tool_result = f"Unknown tool: '{tool_name}'"
 
@@ -595,16 +597,15 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
 
         system_prompt = f"""You are LegalMind, a professional Indian legal assistant operating on WhatsApp.
 
-CRITICAL BEHAVIORAL INSTRUCTIONS:
+CRITICAL BEHAVIORAL CONTRACT:
 1. You MUST respond strictly in {lang_name} language.
-2. NEVER state or claim that you can only assist in English. NEVER ask the user to switch languages.
-3. Use the 'search_statutes' tool whenever the user describes a legal incident or asks about their rights/remedies under Indian law.
-4. When presenting legal rights, provide a structured assessment (ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON ACTION GUIDE). Always base the RULE strictly on retrieved context.
+2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr'), call tool 'draft_legal_notice(sender_name="vishnu", recipient_name="wex company hr", issue_summary=...)' IMMEDIATELY. DO NOT ask for names again when they are present in the text!
+3. Use the 'search_statutes' tool ONLY when the user describes an initial legal problem or asks about their rights/remedies without providing notice recipient details.
+4. When presenting initial legal rights, provide a structured assessment (ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON ACTION GUIDE) based strictly on context retrieved by search_statutes.
 5. End legal assessments by asking the user if they want a formal legal notice drafted.
-6. When the user provides names or agrees to a notice, extract the Sender name (client / അയക്കുന്നയാൾ) and Recipient name (opposing party / ലഭിക്കേണ്ടയാൾ) from the conversation/text and call 'draft_legal_notice' IMMEDIATELY without repeating previous legal roadmap text.
-7. If Sender or Recipient names are missing, politely ask the user for the missing name(s) directly in {lang_name}.
-8. NEVER fabricate statutory section numbers, addresses, or personal details.
-9. Keep responses concise, actionable, and warm.
+6. If Sender or Recipient names are missing when drafting a notice, politely ask the user for the missing name(s) directly in {lang_name}.
+7. NEVER fabricate statutory section numbers, addresses, or personal details.
+8. Keep responses concise, actionable, and warm.
 
 MALAYALAM LEGAL VOCABULARY MANDATES:
 When writing in Malayalam, you MUST strictly use these exact legal terms:
