@@ -332,6 +332,320 @@ class LegalMindPipeline:
         
         raise last_err
 
+    def _call_llm(self, system_prompt: str, messages: List[Dict[str, str]], temperature: float = 0.0, format_json: bool = False) -> str:
+        """Call LLM with proper system prompt + structured chat messages.
+        
+        This is the CORRECT way to call the LLM for dialogue generation.
+        Unlike _call_ollama_api (which sends everything as a single user message),
+        this method separates the system prompt from user/assistant messages,
+        giving the LLM proper behavioral anchoring.
+        
+        Args:
+            system_prompt: The system-level instruction (role, behavior, constraints)
+            messages: List of {"role": "user"|"assistant", "content": "..."} dicts
+            temperature: Sampling temperature
+            format_json: If True, request JSON output format
+        """
+        import urllib.request
+        import urllib.error
+        import json
+        import time
+
+        # Build the full messages array with system prompt first
+        full_messages = [{"role": "system", "content": system_prompt}]
+        for msg in messages:
+            full_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        # Try Groq first if configured
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key and groq_api_key.strip():
+            default_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            models_to_try = [
+                default_model,
+                "llama-3.3-70b-versatile",
+                "llama3-8b-8192",
+                "mixtral-8x7b-32768"
+            ]
+            seen = set()
+            models_to_try = [x for x in models_to_try if not (x in seen or seen.add(x))]
+            
+            groq_url = "https://api.groq.com/openai/v1/chat/completions"
+            
+            for model in models_to_try:
+                payload = {
+                    "model": model,
+                    "messages": full_messages,
+                    "temperature": temperature
+                }
+                if format_json:
+                    payload["response_format"] = {"type": "json_object"}
+                
+                backoffs = [1, 2, 4]
+                for attempt_num, sleep_time in enumerate(backoffs, 1):
+                    try:
+                        req = urllib.request.Request(
+                            groq_url,
+                            data=json.dumps(payload).encode('utf-8'),
+                            headers={
+                                'Content-Type': 'application/json',
+                                'Authorization': f'Bearer {groq_api_key}',
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                            },
+                            method='POST'
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as response:
+                            res_data = json.loads(response.read().decode('utf-8'))
+                            return res_data["choices"][0]["message"]["content"].strip()
+                    except urllib.error.HTTPError as e:
+                        logger.warning(f"Groq _call_llm model {model} attempt {attempt_num} failed: {e}")
+                        if e.code == 429:
+                            retry_after = e.headers.get("Retry-After") or e.headers.get("x-ratelimit-reset")
+                            try:
+                                if retry_after and retry_after.endswith("s"):
+                                    sleep_sec = float(retry_after[:-1])
+                                elif retry_after and retry_after.endswith("ms"):
+                                    sleep_sec = float(retry_after[:-2]) / 1000.0
+                                else:
+                                    sleep_sec = float(retry_after) if retry_after else sleep_time
+                            except ValueError:
+                                sleep_sec = sleep_time
+                            time.sleep(sleep_sec)
+                        elif e.code == 400 and "model" in str(e).lower():
+                            break
+                        else:
+                            if attempt_num < len(backoffs):
+                                time.sleep(sleep_time)
+                    except Exception as e:
+                        logger.warning(f"Groq _call_llm model {model} attempt {attempt_num} failed: {e}")
+                        if attempt_num < len(backoffs):
+                            time.sleep(sleep_time)
+            
+            logger.warning("All Groq models failed in _call_llm, falling back to local Ollama chat.")
+
+        # Local Ollama fallback — use /api/chat (NOT /api/generate) for proper message support
+        ollama_url = "http://localhost:11434/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": full_messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature
+            }
+        }
+        if format_json:
+            payload["format"] = "json"
+
+        timeouts = [15, 25, 35]
+        last_err = None
+        for attempt_num, timeout in enumerate(timeouts, 1):
+            try:
+                req = urllib.request.Request(
+                    ollama_url,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    return res_data.get("message", {}).get("content", "").strip()
+            except urllib.error.URLError as e:
+                if isinstance(e.reason, ConnectionRefusedError) or "connection refused" in str(e.reason).lower():
+                    logger.error("Local Ollama connection refused in _call_llm. Aborting.")
+                    last_err = e
+                    break
+                logger.warning(f"Ollama _call_llm attempt {attempt_num} failed (timeout={timeout}s): {e}")
+                last_err = e
+                if attempt_num < len(timeouts):
+                    time.sleep(2)
+            except Exception as e:
+                logger.warning(f"Ollama _call_llm attempt {attempt_num} failed (timeout={timeout}s): {e}")
+                last_err = e
+                if attempt_num < len(timeouts):
+                    time.sleep(2)
+        
+        raise last_err
+
+    def _build_system_prompt(self, state: str, slots: Dict[str, Any], detected_lang: str, retrieved_statutes: str = "") -> str:
+        """Build a state-aware system prompt that anchors LLM behavior.
+        
+        This is the CORE fix for hallucination: every LLM generation call
+        gets a strong system prompt telling it exactly what to do based on
+        the current dialogue state.
+        """
+        lang_name = "Malayalam" if detected_lang == "ml" else "English"
+        lang_constraint = f"You MUST respond ONLY in {lang_name}. Do NOT include any other language."
+        
+        slots_summary = json.dumps({k: v for k, v in slots.items() if v is not None and k != "slots_complete"}, ensure_ascii=False)
+        
+        state_instructions = {
+            "GREETING": (
+                "Your job: Welcome the user warmly. Explain you are LegalMind, an Indian legal assistant "
+                "that can verify rights under Indian statutes and draft formal legal notices. "
+                "Ask them to describe their legal issue, including when and where it happened. "
+                "Keep it to 2-3 sentences maximum."
+            ),
+            "SLOT_FILLING": (
+                "Your job: Ask the user ONE specific question to collect a missing detail about their case. "
+                "Missing details may include: when the incident happened, where (which state/city), "
+                "what exactly happened, or which institution/person is involved. "
+                "Ask only ONE question. Be warm and brief. Do NOT repeat questions already asked."
+            ),
+            "RAG_RETRIEVE": (
+                "Your job: Generate an IRAC legal assessment using ONLY the retrieved statutes provided. "
+                "Format: ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON sections. "
+                "The RULE must cite ONLY from the retrieved statutes — never fabricate statute text. "
+                "End by asking if the user wants a formal legal notice drafted."
+            ),
+            "NOTICE_INTAKE": (
+                "Your job: The user has agreed to draft a legal notice. "
+                "Ask them to provide the name of the Sender (the person sending the notice / complainant) "
+                "and the Recipient (the opposing party / person receiving the notice). "
+                "Be clear and concise. Ask ONLY for these two names."
+            ),
+            "NOTICE_DRAFT": (
+                "Your job: Draft a formal legal notice using the gathered facts and names provided."
+            ),
+            "FOLLOWUP": (
+                "Your job: Answer the user's follow-up question based on the conversation history "
+                "and any previous legal assessment. Be helpful and specific."
+            ),
+        }
+        
+        instruction = state_instructions.get(state, "Your job: Respond helpfully to the user's message.")
+        
+        system_prompt = f"""You are LegalMind, a professional Indian legal assistant operating on WhatsApp.
+
+Current dialogue state: {state}
+{lang_constraint}
+
+Gathered facts about the user's case:
+{slots_summary}
+
+{f"Retrieved legal statutes:{chr(10)}{retrieved_statutes}" if retrieved_statutes else ""}
+
+{instruction}
+
+STRICT RULES:
+- NEVER generate emotional support paragraphs or motivational filler.
+- NEVER mention political opinion, freedom of speech, or unrelated topics.
+- NEVER repeat the same sentence more than once.
+- NEVER fabricate legal statutes, section numbers, or case law.
+- Output ONLY what the current state requires — nothing more.
+- Keep responses concise and actionable."""
+        
+        return system_prompt
+
+    def _build_chat_messages(self, history: List[Dict[str, str]], current_query: str) -> List[Dict[str, str]]:
+        """Convert conversation history + current query into structured chat messages."""
+        messages = []
+        for turn in (history or []):
+            role = "user" if turn.get("role") == "user" else "assistant"
+            text = turn.get("text") or turn.get("response_text") or ""
+            if text.strip():
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": current_query})
+        return messages
+
+    def _validate_response_quality(self, response: str, expected_state: str, detected_lang: str) -> bool:
+        """Python-level quality gate to catch hallucination, repetition, and off-topic content.
+        Returns True if response passes quality checks, False if it should be rejected."""
+        if not response or not response.strip():
+            return False
+        
+        # Check 1: Sentence repetition detection
+        sentences = [s.strip() for s in re.split(r'[.!?।\n]', response) if s.strip() and len(s.strip()) > 10]
+        if sentences:
+            from collections import Counter
+            sentence_counts = Counter(sentences)
+            most_common_count = sentence_counts.most_common(1)[0][1] if sentence_counts else 0
+            if most_common_count >= 3:
+                logger.warning(f"Quality gate FAILED: Sentence repeated {most_common_count} times")
+                return False
+        
+        # Check 2: Off-topic content detection (political opinion, unrelated freedom talk)
+        off_topic_markers = [
+            "രാഷ്ട്രീയ അഭിപ്രായം",  # political opinion
+            "രാഷ്ട്രീയ",  # political
+            "സ്വാതന്ത്ര്യം നിങ്ങളുടെയാണ്",  # your freedom is yours (repeated filler)
+            "political opinion",
+            "freedom of expression",
+        ]
+        # Only flag if NOT a civil liberties case
+        if expected_state not in ["RAG_RETRIEVE", "FOLLOWUP"]:
+            for marker in off_topic_markers:
+                if marker in response:
+                    logger.warning(f"Quality gate FAILED: Off-topic marker detected: '{marker}'")
+                    return False
+        
+        # Check 3: Response too short for states that need substance
+        if expected_state in ["RAG_RETRIEVE", "NOTICE_DRAFT"] and len(response) < 50:
+            logger.warning(f"Quality gate FAILED: Response too short ({len(response)} chars) for state {expected_state}")
+            return False
+        
+        # Check 4: Detect word-level repetition loops (same phrase 5+ times)
+        words = response.split()
+        if len(words) > 20:
+            # Check for repeating 3-word phrases
+            trigrams = [' '.join(words[i:i+3]) for i in range(len(words) - 2)]
+            from collections import Counter
+            trigram_counts = Counter(trigrams)
+            if trigram_counts and trigram_counts.most_common(1)[0][1] >= 5:
+                logger.warning(f"Quality gate FAILED: Repetitive trigram loop detected")
+                return False
+        
+        return True
+
+    def _get_hardcoded_fallback(self, expected_state: str, detected_lang: str, missing_slots: List[str] = None) -> str:
+        """Return a guaranteed-correct hardcoded response for each state.
+        Used when ALL LLM generation attempts fail quality checks."""
+        
+        if detected_lang == "ml":
+            fallbacks = {
+                "GREETING": "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി പറയാമോ?",
+                "SLOT_FILLING": self._get_slot_filling_fallback_ml(missing_slots),
+                "NOTICE_INTAKE": "നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. നോട്ടീസ് അയക്കുന്നയാളുടെ പേരും സ്വീകർത്താവിന്റെ പേരും ദയവായി പറയാമോ?",
+                "FOLLOWUP": "ദയവായി നിങ്ങളുടെ ചോദ്യം വീണ്ടും വ്യക്തമാക്കാമോ?",
+                "CLARIFY": "എനിക്ക് മനസ്സിലായില്ല. ദയവായി നിങ്ങളുടെ നിയമപരമായ പ്രശ്നം വിശദീകരിക്കാമോ?",
+            }
+        else:
+            fallbacks = {
+                "GREETING": "Welcome to LegalMind! I can help you verify your rights under Indian statutes and draft formal legal notices. Could you please describe your legal issue, including when and where it occurred?",
+                "SLOT_FILLING": self._get_slot_filling_fallback_en(missing_slots),
+                "NOTICE_INTAKE": "I can help you draft a formal legal notice. Could you please provide the name of the Sender (you / the complainant) and the Recipient (the opposing party)?",
+                "FOLLOWUP": "Could you please clarify your question?",
+                "CLARIFY": "I didn't quite understand that. Could you please describe your legal issue in more detail?",
+            }
+        
+        return fallbacks.get(expected_state, fallbacks.get("CLARIFY", ""))
+
+    def _get_slot_filling_fallback_ml(self, missing_slots: List[str] = None) -> str:
+        """Malayalam fallback questions for specific missing slots."""
+        if not missing_slots:
+            return "ദയവായി നിങ്ങളുടെ പ്രശ്നം വിശദീകരിക്കാമോ?"
+        slot = missing_slots[0]
+        slot_questions = {
+            "incident_description": "എന്ത് സംഭവിച്ചതെന്ന് ദയവായി പറയാമോ?",
+            "incident_date": "ഇത് എപ്പോൾ നടന്നതാണ്?",
+            "jurisdiction": "ഇത് ഏത് ജില്ലയിലാണ് നടന്നത്?",
+            "institution": "ഏത് സ്ഥാപനത്തിലാണ് ഇത് നടന്നത്?",
+            "issue_type": "എന്ത് തരത്തിലുള്ള പ്രശ്നമാണ് നിങ്ങൾ നേരിടുന്നത്?",
+        }
+        return slot_questions.get(slot, "ദയവായി കൂടുതൽ വിവരങ്ങൾ പറയാമോ?")
+
+    def _get_slot_filling_fallback_en(self, missing_slots: List[str] = None) -> str:
+        """English fallback questions for specific missing slots."""
+        if not missing_slots:
+            return "Could you please describe your issue in more detail?"
+        slot = missing_slots[0]
+        slot_questions = {
+            "incident_description": "Could you please describe what happened?",
+            "incident_date": "When did this incident occur?",
+            "jurisdiction": "In which city or state did this happen?",
+            "institution": "Which institution or organization is involved?",
+            "issue_type": "What kind of legal issue are you facing?",
+        }
+        return slot_questions.get(slot, "Could you please provide more details?")
+
     def extract_intent_node(self, state: LegalState) -> Dict[str, Any]:
         """Node 1: Translate regional input to Universal English space."""
         query = state["user_query"].strip()
@@ -1533,28 +1847,21 @@ Output format:
         final_faithfulness = 1.0
         retrieved_ids = []
         retrieved_context_text = ""
+        # Build structured chat messages for _call_llm()
+        chat_messages = self._build_chat_messages(history, query)
+
+        # Compute missing slots list (needed for fallbacks and slot-filling)
+        rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
+        missing_slots_list = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
 
         for attempt in range(3):
             generated_text = ""
             if expected_state == "GREETING":
-                if detected_lang == "ml":
-                    gen_prompt = f"""You are a warm, helpful legal assistant chatbot named LegalMind.
-The user has sent a greeting: "{query}".
-Respond ONLY in Malayalam. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue.
-Do not include any English text. Only return Malayalam response."""
-                    try:
-                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
-                    except Exception:
-                        generated_text = "ലീഗൽമൈൻഡിലേക്ക് സ്വാഗതം! ഇന്ത്യൻ നിയമപ്രകാരമുള്ള നിങ്ങളുടെ അവകാശങ്ങൾ പരിശോധിക്കാൻ ഞാൻ സഹായിക്കാം. തുടങ്ങുന്നതിനായി, നിങ്ങളുടെ പ്രശ്നം എന്താണെന്നും, അത് എപ്പോൾ, എവിടെയാണ് സംഭവിച്ചതെന്നും ദയവായി വ്യക്തമാക്കാമോ?"
-                else:
-                    gen_prompt = f"""You are a warm, helpful legal assistant chatbot named LegalMind.
-The user has sent a greeting: "{query}".
-Respond ONLY in English. Explain that you can help them verify their rights under Indian statutes and draft formal legal notices. Prompt them to describe their legal issue, including when and where it occurred.
-Do not include any other language. Only return English response."""
-                    try:
-                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.7).strip()
-                    except Exception:
-                        generated_text = "Welcome to LegalMind! I can help you verify your rights under Indian statutes. To start, could you please describe your legal issue, including when and where it occurred?"
+                system_prompt = self._build_system_prompt("GREETING", session_slots, detected_lang)
+                try:
+                    generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.7).strip()
+                except Exception:
+                    generated_text = self._get_hardcoded_fallback("GREETING", detected_lang)
             elif expected_state == "SLOT_FILLING":
                 # Determine if IRAC roadmap has ever been delivered in the history
                 irac_delivered = False
@@ -1565,11 +1872,13 @@ Do not include any other language. Only return English response."""
                         break
                 
                 
-                rag_essential = ["issue_type", "incident_date", "jurisdiction", "incident_description"]
                 if not irac_delivered:
                     missing = [k for k in rag_essential if session_slots.get(k) is None or str(session_slots.get(k)).lower() in ["null", "none", ""]]
                 else:
                     missing = [k for k, v in session_slots.items() if v is None and k not in ["slots_complete", "parties_mentioned"]]
+                
+                # Update missing_slots_list for fallback use
+                missing_slots_list = missing
                 
                 # --- FIX 2: Slot attempt loop guard ---
                 # Track how many times we've asked for each slot.
@@ -1604,36 +1913,26 @@ Do not include any other language. Only return English response."""
                     self._last_slot_attempts = slot_attempts
                 
                 missing_str = ", ".join(missing) if missing else "more details"
-                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
                 
-                # Dynamic few-shot examples for Malayalam — FIX 4: natural conversational phrasing
-                malayalam_instruction = ""
+                # Build state-aware system prompt with missing slot info
+                system_prompt = self._build_system_prompt("SLOT_FILLING", session_slots, detected_lang)
+                system_prompt += f"\n\nMissing details still needed: {missing_str}"
+                system_prompt += "\nAsk for ONE of these missing details. Do NOT ask for details already provided in the gathered facts."
+                
                 if detected_lang == "ml":
-                    malayalam_instruction = """
-IMPORTANT: You MUST generate a natural, warm, conversational Malayalam question. 
-Do NOT use literal/robotic translations of English labels.
-Do NOT use words like "വിവരണം", "നൽകുകയാണോ?", "ജില്ലാ പേര്" — these sound robotic and unnatural.
-
+                    system_prompt += """
 Use EXACTLY these natural phrasing styles:
-- If asking for 'incident_description': "എന്ത് സംഭവിച്ചതെന്ന് പറയാമോ?" (What happened?)
-- If asking for 'incident_date': "ഇത് എപ്പോൾ നടന്നതാണ്?" (When did this happen?)
-- If asking for 'jurisdiction': "ഇത് ഏത് ജില്ലയിലാണ് നടന്നത്?" (Which district did this happen in?)
-- If asking for 'institution': "ഏത് സ്ഥാപനത്തിലാണ് ഇത് നടന്നത്?" (Which institution did this happen at?)
-- If asking for 'issue_type': "എന്ത് തരത്തിലുള്ള പ്രശ്നമാണ് നിങ്ങൾ നേരിടുന്നത്?" (What kind of problem are you facing?)
-
-Generate ONLY one short question. Do not repeat previous questions.
+- For 'incident_description': "എന്ത് സംഭവിച്ചതെന്ന് പറയാമോ?"
+- For 'incident_date': "ഇത് എപ്പോൾ നടന്നതാണ്?"
+- For 'jurisdiction': "ഇത് ഏത് ജില്ലയിലാണ് നടന്നത്?"
+- For 'institution': "ഏത് സ്ഥാപനത്തിലാണ് ഇത് നടന്നത്?"
+- For 'issue_type': "എന്ത് തരത്തിലുള്ള പ്രശ്നമാണ് നിങ്ങൾ നേരിടുന്നത്?"
 """
-
-                gen_prompt = f"""You are a helpful legal assistant.
-Given the current session slots: {json.dumps(session_slots)}
-And the conversation history:
-{history_str}
-
-Generate a polite, brief question asking the user for ONE of the missing slots: {missing_str}.
-Respond ONLY in {resp_lang}. Do not include any other language.
-{malayalam_instruction}
-Do not include any greetings, notes, or intros. Only return the question."""
-                generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                
+                try:
+                    generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.5).strip()
+                except Exception:
+                    generated_text = self._get_hardcoded_fallback("SLOT_FILLING", detected_lang, missing)
             elif expected_state in ["RAG_RETRIEVE", "NOTICE_OFFER"]:
                 search_query = session_slots["incident_description"] if session_slots["incident_description"] else query
                 initial_state = {
@@ -1659,19 +1958,11 @@ Do not include any greetings, notes, or intros. Only return the question."""
                 retrieved_docs_list = result.get("reranked_docs", []) or result.get("retrieved_docs", [])
                 retrieved_context_text = "\n\n".join([f"[{doc.get('citation')}]: {doc.get('text')}" for doc in retrieved_docs_list])
             elif expected_state == "NOTICE_INTAKE":
-                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
-                gen_prompt = f"""You are a helpful, professional legal assistant chatbot.
-The user wants to draft a formal legal notice.
-Acknowledge their request. Explain politely that before you can compile the document, you need the names of the Sender (the person sending the notice) and the Recipient (the opposing party/person receiving the notice).
-Respond ONLY in {resp_lang}. Do not include any other language.
-Do not include any placeholders, notes, or explanations. Only return the response text."""
+                system_prompt = self._build_system_prompt("NOTICE_INTAKE", session_slots, detected_lang)
                 try:
-                    generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                    generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.5).strip()
                 except Exception:
-                    if detected_lang == "ml":
-                        generated_text = "തീർച്ചയായും! ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് തയ്യാറാക്കാൻ ഞാൻ സഹായിക്കാം. നോട്ടീസ് അയക്കുന്നയാളുടെയും (Sender), ലഭിക്കേണ്ടയാളുടെയും (Recipient) പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
-                    else:
-                        generated_text = "Sure! I can help you draft a formal legal notice. Before we proceed, could you please provide the names of the Sender and the Recipient?"
+                    generated_text = self._get_hardcoded_fallback("NOTICE_INTAKE", detected_lang)
             elif expected_state == "NOTICE_DRAFT":
                 names_prompt = f"""Given the conversation history, extract the names of the Sender (the person sending the notice / client) and the Recipient (the opposing party / person receiving the notice).
 Conversation history:
@@ -1704,19 +1995,13 @@ Output ONLY valid JSON matching this schema:
                         recipient_name = recipient_name or parties[1]
                 
                 if not sender_name or not recipient_name or str(sender_name).lower() == "null" or str(recipient_name).lower() == "null":
-                    resp_lang = "Malayalam" if detected_lang == "ml" else "English"
-                    gen_prompt = f"""You are a helpful legal assistant chatbot.
-The user wants to draft a formal legal notice, but you are still missing the names of the Sender and/or the Recipient.
-Politely ask the user to provide the missing name(s).
-Respond ONLY in {resp_lang}. Do not include any other language.
-Do not include any placeholders, notes, or explanations. Only return the response text."""
+                    # Still missing names — ask using structured _call_llm
+                    system_prompt = self._build_system_prompt("NOTICE_INTAKE", session_slots, detected_lang)
+                    system_prompt += "\nIMPORTANT: The sender and/or recipient name is still missing. Ask the user to provide the missing name(s)."
                     try:
-                        generated_text = self._call_ollama_api(gen_prompt, temperature=0.5).strip()
+                        generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.5).strip()
                     except Exception:
-                        if detected_lang == "ml":
-                            generated_text = "നോട്ടീസ് അയക്കുന്നയാളുടെയും ലഭിക്കേണ്ടയാളുടെയും പേരുകൾ ദയവായി വ്യക്തമാക്കാമോ?"
-                        else:
-                            generated_text = "Could you please provide the names of the Sender and the Recipient for the legal notice?"
+                        generated_text = self._get_hardcoded_fallback("NOTICE_INTAKE", detected_lang)
                 else:
                     statutes_prompt = f"""Given the conversation history, extract the names of any legal statutes or regulations cited in the legal roadmap or assessment (for example: "Kerala Prohibition Of Ragging Act, 1998").
 Conversation history:
@@ -1746,7 +2031,8 @@ Output ONLY the names of the statutes as a comma-separated list. Do not add othe
                     # Placeholder text in session language
                     placeholder_text = "[അയക്കുന്നയാൾ പൂരിപ്പിക്കേണ്ടതാണ്]" if detected_lang == "ml" else "[TO BE FILLED BY SENDER]"
                     
-                    draft_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
+                    # Use _call_llm with system prompt for the notice draft
+                    draft_system_prompt = f"""You are a formal legal notice drafter for an Indian legal aid system.
 
 Your task is to draft a FORMAL LEGAL NOTICE — a structured 
 official document used to assert legal rights and demand remedy.
@@ -1786,7 +2072,9 @@ DO NOT add any content not in the gathered facts.
 DO NOT invent addresses — use {placeholder_text} for any unknown address.
 DO NOT quote or fabricate statute text verbatim — describe violations in your own words.
 DO NOT refuse to draft this — it is a civil legal document."""
-                    draft = self._call_ollama_api(draft_prompt, temperature=0.3)
+                    
+                    draft_messages = [{"role": "user", "content": "Please draft the formal legal notice based on the facts and statutes provided."}]
+                    draft = self._call_llm(draft_system_prompt, draft_messages, temperature=0.3)
                     download_url = self.generate_notice_document_file(draft, sender_name, recipient_name, language=detected_lang)
                     generated_text = (
                         f"### DRAFT FORMAL LEGAL NOTICE\n\n"
@@ -1797,38 +2085,31 @@ DO NOT refuse to draft this — it is a civil legal document."""
                         f"[DOWNLOAD_URL:{download_url}]"
                     )
             elif expected_state == "FOLLOWUP":
-                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
-                gen_prompt = f"""You are a helpful legal assistant.
-Answering the user's follow-up question or query based on the conversation history and previous legal assessment.
-Conversation history:
-{history_str}
-Latest user message:
-{query}
-
-Respond ONLY in {resp_lang}. Do not include any other language.
-Generate a polite and clear response. Do not include any notes, prefixes, or intros. Only return the response."""
-                generated_text = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
-            elif expected_state == "CLARIFY":
-                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
-                gen_prompt = f"""Respond ONLY in {resp_lang}: Could you please clarify your question or describe your legal issue in more detail?"""
-                generated_text = self._call_ollama_api(gen_prompt, temperature=0.0).strip()
-            else:
-                # Unknown state — use LLM to generate a contextual response
-                resp_lang = "Malayalam" if detected_lang == "ml" else "English"
-                gen_prompt = f"""You are a helpful legal assistant chatbot named LegalMind.
-The user sent: "{query}"
-Conversation history:
-{history_str}
-
-Respond helpfully in {resp_lang}. If you cannot understand their request, ask them to clarify.
-Do not include any notes, prefixes, or intros. Only return the response."""
+                system_prompt = self._build_system_prompt("FOLLOWUP", session_slots, detected_lang)
                 try:
-                    generated_text = self._call_ollama_api(gen_prompt, temperature=0.3).strip()
+                    generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.3).strip()
                 except Exception:
-                    if detected_lang == "ml":
-                        generated_text = "എനിക്ക് മനസ്സിലായില്ല. ദയവായി നിങ്ങളുടെ നിയമപരമായ പ്രശ്നം വിശദീകരിക്കാമോ?"
-                    else:
-                        generated_text = "I didn't quite understand that. Could you please describe your legal issue in more detail?"
+                    generated_text = self._get_hardcoded_fallback("FOLLOWUP", detected_lang)
+            elif expected_state == "CLARIFY":
+                generated_text = self._get_hardcoded_fallback("CLARIFY", detected_lang)
+            else:
+                # Unknown state — use _call_llm with generic system prompt
+                system_prompt = self._build_system_prompt(expected_state, session_slots, detected_lang)
+                try:
+                    generated_text = self._call_llm(system_prompt, chat_messages, temperature=0.3).strip()
+                except Exception:
+                    generated_text = self._get_hardcoded_fallback("CLARIFY", detected_lang)
+
+            # --- Python-level quality gate (BEFORE LLM shield validator) ---
+            if not self._validate_response_quality(generated_text, expected_state, detected_lang):
+                logger.warning(f"Python quality gate REJECTED response at attempt {attempt + 1} for state {expected_state}")
+                if attempt == 2:
+                    # All 3 attempts failed quality gate — use hardcoded fallback
+                    generated_text = self._get_hardcoded_fallback(expected_state, detected_lang, missing_slots_list)
+                    logger.info(f"Using hardcoded fallback for state {expected_state}")
+                    final_response_text = generated_text
+                    break
+                continue
 
             shield_res = self._call_shield_validator(expected_state, session_slots, generated_text, retrieved_ids, last_assistant_response)
             score = shield_res.get("score", 1.0)
@@ -1844,10 +2125,7 @@ Do not include any notes, prefixes, or intros. Only return the response."""
         # GUARANTEED NON-EMPTY RESPONSE — never return empty text
         if not final_response_text or not final_response_text.strip():
             logger.error("Pipeline produced empty response! Generating fallback.")
-            if detected_lang == "ml":
-                final_response_text = "എനിക്ക് മനസ്സിലായില്ല. ദയവായി നിങ്ങളുടെ പ്രശ്നം വിശദീകരിക്കാമോ?"
-            else:
-                final_response_text = "I apologize, but I couldn't process your request. Could you please describe your legal issue again?"
+            final_response_text = self._get_hardcoded_fallback(expected_state, detected_lang, missing_slots_list)
 
         return {
             "status": final_status,
@@ -1856,7 +2134,8 @@ Do not include any notes, prefixes, or intros. Only return the response."""
             "context": retrieved_context_text,
             "slot_attempts": getattr(self, '_last_slot_attempts', {}),
             "sender_name": session_slots.get("sender_name"),
-            "recipient_name": session_slots.get("recipient_name")
+            "recipient_name": session_slots.get("recipient_name"),
+            "expected_state": expected_state
         }
 
 if __name__ == "__main__":

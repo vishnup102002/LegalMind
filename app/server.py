@@ -717,6 +717,10 @@ async def whatsapp_webhook(
         # Persist updated slot_attempts back to session
         session["slot_attempts"] = result.get("slot_attempts", slot_attempts)
         
+        # Persist pipeline state back to session for next turn's routing
+        if result.get("expected_state"):
+            session["state"] = result["expected_state"]
+        
         # CRITICAL: Never proceed with empty response — fallback
         if not response_text or not response_text.strip():
             logger.error(f"Pipeline returned empty response for {From}! Sending fallback.")
