@@ -712,19 +712,15 @@ async def whatsapp_webhook(
         
     history = session.get("history", [])
 
-    # 4. Invoke the pipeline and manage responses safely
+    # 4. Invoke the pipeline agent loop cleanly
     try:
-        # Pass slot_attempts from session for loop guard (Fix 2)
-        slot_attempts = session.get("slot_attempts", {})
-        result = pipeline.run(user_message, history=history, language=session.get("lang"), slot_attempts=slot_attempts)
+        result = pipeline.run(
+            query=user_message,
+            history=history,
+            language=session.get("lang"),
+            phone=phone_number
+        )
         response_text = result["response_text"]
-        
-        # Persist updated slot_attempts back to session
-        session["slot_attempts"] = result.get("slot_attempts", slot_attempts)
-        
-        # Persist pipeline state back to session for next turn's routing
-        if result.get("expected_state"):
-            session["state"] = result["expected_state"]
         
         # CRITICAL: Never proceed with empty response — fallback
         if not response_text or not response_text.strip():
