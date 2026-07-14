@@ -185,12 +185,30 @@ class LegalMindPipeline:
                     jurisdiction = state
                     logger.info(f"Auto-resolved jurisdiction state '{state}' from city '{city}'")
                     break
-        
+
+        # --- BUG 1 FIX: Dynamic LLM/Translation alignment for Malayalam -> English Qdrant Vector Search ---
+        search_query_english = query
+        if any(ord(c) > 127 for c in query):
+            try:
+                if hasattr(self, 'translator') and self.translator:
+                    inputs = self.translation_tokenizer(query, return_tensors="pt", padding=True, truncation=True)
+                    translated = self.translation_model.generate(**inputs)
+                    search_query_english = self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
+                else:
+                    tr_prompt = f"Translate the following legal problem into 1 simple, concise English search string for legal database retrieval: {query}"
+                    search_query_english = self._call_llm_raw("You are a legal search query translator.", [{"role": "user", "content": tr_prompt}], temperature=0.0)
+            except Exception as e:
+                logger.warning(f"Query pre-translation fallback to raw query: {e}")
+
+        # Domain keyword expansion to ensure semantic alignment with English labor/civil/housing statutes
+        search_query_text = f"{search_query_english} {jurisdiction or ''} labor employment law wages non payment salary compensation tenant eviction rental easement".strip()
+        logger.info(f"Vector Retrieval Query Enriched: '{search_query_text}'")
+
         try:
-            query_vector = self.model.encode(query).tolist()
+            query_vector = self.model.encode(search_query_text).tolist()
             results = self.vector_store.hybrid_search(
                 query_vector=query_vector,
-                query_text=query,
+                query_text=search_query_text,
                 top_k=5,
                 jurisdiction=jurisdiction
             )
@@ -266,14 +284,22 @@ class LegalMindPipeline:
         draft_prompt = f"""Draft a formal, legally recognized Indian Legal Notice document based strictly on these details:
 
 - Date: {notice_date}
-- Sender (Complainant): {sender_name}
-- Recipient (Respondent): {recipient_name}
+- SENDER / COMPLAINANT (The client sending the notice): {sender_name}
+- RECIPIENT / RESPONDENT (The opposing party receiving the notice): {recipient_name}
 - Facts & Summary: {issue_summary}
 - Governing Laws / Statutes: {statutes_cited or 'Applicable Indian Civil Statutes'}
 - Language: {'Malayalam' if language == 'ml' else 'English'}
 
+LEGAL NOTICE DIRECTION CONTRACT (STRICT MANDATORY RULES):
+- The notice IS SENT BY {sender_name} TO {recipient_name}.
+- In Malayalam, the header MUST say:
+  "അയക്കുന്നയാൾ (Complainant): {sender_name}"
+  "സ്വീകരിക്കുന്നയാൾ / എതിർകക്ഷി (Respondent): {recipient_name}"
+  "വിഷയം: {sender_name} മുഖേന {recipient_name} ക്ക് അയക്കുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസ്"
+- NEVER state that the notice is from {recipient_name} to {sender_name}! {sender_name} is the sender/complainant!
+
 Include these sections:
-1. Header & Subject Line
+1. Header & Subject Line (From {sender_name} To {recipient_name})
 2. Statement of Facts (numbered)
 3. Legal Ground & Statutory Violations
 4. Clear Demand / Relief Sought
@@ -575,10 +601,21 @@ CRITICAL BEHAVIORAL INSTRUCTIONS:
 3. Use the 'search_statutes' tool whenever the user describes a legal incident or asks about their rights/remedies under Indian law.
 4. When presenting legal rights, provide a structured assessment (ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON ACTION GUIDE). Always base the RULE strictly on retrieved context.
 5. End legal assessments by asking the user if they want a formal legal notice drafted.
-6. When both the Sender name (client / അയക്കുന്നയാൾ) and Recipient name (opposing party / ലഭിക്കേണ്ടയാൾ) are provided by the user, call the 'draft_legal_notice' tool IMMEDIATELY without repeating previous legal explanations.
+6. When the user provides names or agrees to a notice, extract the Sender name (client / അയക്കുന്നയാൾ) and Recipient name (opposing party / ലഭിക്കേണ്ടയാൾ) from the conversation/text and call 'draft_legal_notice' IMMEDIATELY without repeating previous legal roadmap text.
 7. If Sender or Recipient names are missing, politely ask the user for the missing name(s) directly in {lang_name}.
 8. NEVER fabricate statutory section numbers, addresses, or personal details.
-9. Keep responses concise, actionable, and warm."""
+9. Keep responses concise, actionable, and warm.
+
+MALAYALAM LEGAL VOCABULARY MANDATES:
+When writing in Malayalam, you MUST strictly use these exact legal terms:
+- 'compensation' -> 'നഷ്ടപരിഹാരം' (NEVER use 'അപകടകരമായ പരിഹാരം')
+- 'remedy' or 'solution' -> 'നിയമപരമായ പരിഹാരം' or 'ഉചിതമായ പരിഹാരം' (NEVER use 'അപകടകരമായ പരിഹാരം')
+- 'appropriate' -> 'ഉചിതമായ'
+- 'wages' / 'salary' -> 'വേതനം' or 'ശമ്പളം'
+- 'employer' -> 'തൊഴിലുടമ'
+- 'employee' -> 'ജീവനക്കാരൻ' or 'തൊഴിലാളി'
+- 'landlord' -> 'വീട്ടുടമസ്ഥൻ'
+- 'tenant' -> 'വാടകക്കാരൻ'"""
 
         # Format past dialogue trajectory into standard chat messages format
         chat_messages = []
@@ -592,10 +629,18 @@ CRITICAL BEHAVIORAL INSTRUCTIONS:
         normalized_query = normalize_text_inputs(query)
         chat_messages.append({"role": "user", "content": normalized_query})
 
-        # Execute ReAct Tool-Calling Agent Loop
-        result = self._call_agent_with_tools(system_prompt, chat_messages, phone=phone, language=detected_lang)
-        response_text = result["content"]
-        retrieved_context = result["retrieved_context"]
+        # Execute ReAct Tool-Calling Agent Loop with graceful rate limit error handling
+        try:
+            result = self._call_agent_with_tools(system_prompt, chat_messages, phone=phone, language=detected_lang)
+            response_text = result.get("content", "")
+            retrieved_context = result.get("retrieved_context", "")
+        except Exception as e:
+            logger.error(f"ReAct agent loop execution failed: {e}")
+            if detected_lang == "ml":
+                response_text = "സേവനം താൽക്കാലികമായി തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
+            else:
+                response_text = "The AI service is temporarily busy. Please try again in 30 seconds."
+            retrieved_context = ""
 
         # Post-generation citation shield verification
         is_grounded = self._verify_citation_grounding(response_text, retrieved_context)

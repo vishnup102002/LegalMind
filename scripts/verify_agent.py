@@ -46,17 +46,21 @@ def run_verification():
     history_1.append({"role": "user", "text": q1})
     history_1.append({"role": "assistant", "text": res1["response_text"]})
     
-    # Turn 2: User provides names for notice
-    q2 = "അതെ, ഒരു ലീഗൽ നോട്ടീസ് തയ്യാറാക്കണം. അയക്കുന്നയാൾ വിഷ്ണു പി, ലഭിക്കേണ്ടയാൾ റെക്സ് കമ്പനി HR."
+    # Turn 2: User provides names for notice as free-text copied template
+    q2 = "സെന്റർ നാമം നൽകുക: vishnu\nറിസീവർ നാമം നൽകുക: wex company hr"
     res2 = pipeline.run(q2, history=history_1, language="ml", phone="+919876543210")
     print("Turn 2 Status:", res2["status"])
     print("Turn 2 Response Preview:\n", res2["response_text"][:250], "...\n")
     
-    if "[DOWNLOAD_URL:" in res2["response_text"] and "formal_notice_919876543210_" in res2["response_text"]:
-        print("✓ TEST 1 PASSED: PDF compiled successfully with unique phone UUID filename!")
+    no_bad_remedy = "അപകടകരമായ പരിഹാരം" not in res1["response_text"] and "അപകടകരമായ പരിഹാരം" not in res2["response_text"]
+    no_irrigation_act = "ജലസേചന" not in res1["response_text"] and "ജലസേചന" not in res1.get("context", "")
+    has_pdf_link = "[DOWNLOAD_URL:" in res2["response_text"] and "formal_notice_919876543210_" in res2["response_text"]
+
+    if has_pdf_link and no_bad_remedy and no_irrigation_act:
+        print("✓ TEST 1 PASSED: PDF compiled successfully, no bad translations ('അപകടകരമായ പരിഹാരം'), and no wrong statutes ('ജലസേചന')!")
         passed_tests += 1
     else:
-        print("✗ TEST 1 FAILED: Notice PDF link missing or filename collision guard failed.")
+        print(f"✗ TEST 1 FAILED: PDF Link: {has_pdf_link}, No Bad Remedy: {no_bad_remedy}, Correct Statutes: {no_irrigation_act}")
 
     # ------------------------------------------------------------------
     # TEST 2: English Intake -> Notice Generation
