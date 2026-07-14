@@ -526,14 +526,14 @@ def get_pdf_instructions_note(lang: str, sender: str, recipient: str) -> str:
             f"3. Send it to the recipient ({recipient}) via Registered Post or deliver it directly."
         )
 
-def send_whatsapp_response(to: str, text: str, session: dict, download_url: str = None):
-    """Unified response sender. Separates voice and text modalities:
-    - If user modality is voice: sends ONLY TTS audio (no text), plus document attachment if present.
-    - If user modality is text: sends ONLY text, plus document attachment if present."""
+def send_whatsapp_response(to: str, text: str, session: dict, modality: str = "text", download_url: str = None):
+    """Unified response sender. Separates voice and text modalities dynamically per turn:
+    - If input modality is voice: sends TTS audio note, plus document attachment if present.
+    - If input modality is text: sends text reply, plus document attachment if present."""
     import shutil
     
     phone_number = to.replace("whatsapp:", "")
-    is_voice = (session.get("modality") == "voice")
+    is_voice = (modality == "voice")
     
     # 1. Send document attachment first if present
     if download_url:
@@ -550,11 +550,18 @@ def send_whatsapp_response(to: str, text: str, session: dict, download_url: str 
             # Use the session's locked language
             tts_lang = session.get("lang", "en")
             
-            # Extract the layperson section for voice reply if present, otherwise send the whole text
+            # Extract the layperson section AND question prompt for voice reply if present, otherwise send full text
             voice_text = text
-            layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+            layperson_match = re.search(r'(?:LAYPERSON_ML|LAYPERSON|ലളിതമായ നിർദ്ദേശം \(LAYPERSON\)|ലളിതമായ നിർദ്ദേശം):\s*(.+?)(?:\n\n|\n*$)', text, re.IGNORECASE)
+            offer_match = re.search(r'(Would you like me to draft a formal legal notice based on this assessment\?|ഈ വിലയിരുത്തലിന്റെ അടിസ്ഥാനത്തിൽ ഒരു ഔദ്യോഗിക നിയമ നോട്ടീസ് തയ്യാറാക്കാൻ നിങ്ങൾക്ക് താല്പര്യമുണ്ടോ\?)', text, re.IGNORECASE)
+            
             if layperson_match:
-                voice_text = layperson_match.group(1).strip()
+                l_text = layperson_match.group(1).strip()
+                q_text = offer_match.group(1).strip() if offer_match else ""
+                voice_text = f"{l_text} {q_text}".strip()
+            
+            # Clean markdown symbols for cleaner TTS speech
+            voice_text = re.sub(r'[\*\#\_\[\]]', '', voice_text)
             
             # Retry TTS up to 2 times
             for tts_attempt in range(2):
@@ -690,20 +697,18 @@ async def whatsapp_webhook(
         send_whatsapp_text(From, reply)
         return {"status": "ok"}
  
-    # 3. Load session history (session loaded early at start)
+    # 3. Dynamic session language and modality management
+    # Update current modality per turn (voice input gets voice reply, text input gets text reply)
+    current_modality = "voice" if is_voice_input else "text"
+    session["modality"] = current_modality
     
-    # STRICT language locking: lock on the FIRST message only, never change after that
-    if "lang" not in session:
+    # Session language locking: Lock language on first turn or update if Malayalam script is detected
+    if "lang" not in session or session.get("lang") is None:
         session["lang"] = detected_input_lang
-        logger.info(f"Session language LOCKED to '{detected_input_lang}' for {phone_number} (first message)")
-        
-    # STRICT modality locking: lock on the FIRST message only, never change after that
-    if "modality" not in session:
-        if is_voice_input:
-            session["modality"] = "voice"
-        else:
-            session["modality"] = "text"
-        logger.info(f"Session modality LOCKED to '{session['modality']}' for {phone_number} (first message)")
+        logger.info(f"Session language set to '{detected_input_lang}' for {phone_number}")
+    elif detected_input_lang == "ml" and session.get("lang") != "ml":
+        session["lang"] = "ml"
+        logger.info(f"Session language updated to 'ml' for {phone_number} (Malayalam detected)")
         
     history = session.get("history", [])
 
@@ -751,7 +756,7 @@ async def whatsapp_webhook(
             whatsapp_reply = get_pdf_instructions_note(session.get("lang", "en"), sender_name, recipient_name)
 
         # 6. Unified send: text + TTS audio (for voice) + document (if any)
-        send_whatsapp_response(From, whatsapp_reply, session, download_url=download_url)
+        send_whatsapp_response(From, whatsapp_reply, session, modality=current_modality, download_url=download_url)
 
         # 7. Update and save session history
         history.append({"role": "user", "text": user_message})

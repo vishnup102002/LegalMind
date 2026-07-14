@@ -104,11 +104,9 @@ class ShrutamAudioTranscriber:
 
         # 1. Try Groq Cloud Whisper API
         try:
-            # CRITICAL FIX: If session language is Malayalam, ALWAYS force language='ml'
-            # Whisper frequently misdetects Malayalam as Tamil, producing garbled Tamil script
-            effective_language = language
-            if language == "ml":
-                effective_language = "ml"  # Force Malayalam hint
+            # Default to Malayalam ('ml') if no language hint is passed, since LegalMind is targeted at Indic/Malayalam speech.
+            # This prevents Whisper from translating Malayalam speech into English text.
+            effective_language = language or "ml"
             
             transcript, lang = self._process_cloud_groq_asr(audio_bytes, language=effective_language)
             
@@ -127,14 +125,12 @@ class ShrutamAudioTranscriber:
                 if has_tamil_chars and not has_malayalam_chars:
                     logger.warning(f"Whisper detected Tamil but session language is '{language}'. Malayalam→Tamil confusion suspected. Retrying with explicit language='ml'...")
                     transcript_retry, lang_retry = self._process_cloud_groq_asr(audio_bytes, language="ml")
-                    # Use the retry result if it produced Malayalam characters
                     has_ml_retry = any(0x0D00 <= ord(c) <= 0x0D7F for c in transcript_retry)
                     if has_ml_retry or lang_retry == "ml":
                         transcript = transcript_retry
                         lang = "ml"
                         logger.info("✓ Malayalam retry successful — using corrected transcription.")
                     else:
-                        # Still no Malayalam chars — force lang to 'ml' anyway since user spoke Malayalam
                         lang = "ml"
                         logger.warning("Malayalam retry did not produce Malayalam chars, but forcing lang='ml' based on session.")
                     

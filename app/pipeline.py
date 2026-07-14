@@ -526,6 +526,7 @@ Gathered facts about the user's case:
 {instruction}
 
 STRICT RULES:
+- NEVER state or claim that you can only assist in English. NEVER ask the user to switch languages.
 - NEVER generate emotional support paragraphs or motivational filler.
 - NEVER mention political opinion, freedom of speech, or unrelated topics.
 - NEVER repeat the same sentence more than once.
@@ -1579,8 +1580,17 @@ Output format:
         sender_name = slots.get("sender_name")
         recipient_name = slots.get("recipient_name")
 
+        # Determine if notice has already been drafted and delivered in history
+        notice_already_drafted = False
+        for turn in (history or []):
+            if turn.get("role") == "assistant" and "DOWNLOAD_URL" in (turn.get("text") or turn.get("response_text") or ""):
+                notice_already_drafted = True
+                break
+
         # Once IRAC roadmap has been delivered, NEVER loop back to SLOT_FILLING or RAG_RETRIEVE.
         if irac_delivered:
+            if notice_already_drafted:
+                return "FOLLOWUP"
             if is_valid_name(sender_name) and is_valid_name(recipient_name):
                 return "NOTICE_DRAFT"
             
