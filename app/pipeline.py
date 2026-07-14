@@ -628,6 +628,51 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
                 
         # Normalize date and city names in user query
         normalized_query = normalize_text_inputs(query)
+
+        # --- Deterministic Name Extraction & Direct Tool Call ---
+        # If user provides explicit sender/recipient names, bypass LLM and call tool directly.
+        # This eliminates LLM flakiness for notice generation when names are clearly provided.
+        sender_match = re.search(r'(?:അയക്കുന്നയാൾ|sender|from)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        recipient_match = re.search(r'(?:ലഭിക്കേണ്ടയാൾ|recipient|to)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        
+        if sender_match and recipient_match:
+            s_name = sender_match.group(1).strip()
+            r_name = recipient_match.group(1).strip()
+            if s_name and r_name:
+                logger.info(f"Deterministic name extraction: sender='{s_name}', recipient='{r_name}' — bypassing LLM for direct tool call.")
+                # Build issue summary from conversation history
+                issue_parts = []
+                for turn in (history or []):
+                    if turn.get("role") == "user":
+                        issue_parts.append(turn.get("text", ""))
+                issue_summary = " ".join(issue_parts).strip() or normalized_query
+
+                # Call tool directly — no LLM dependency
+                tool_result = self.draft_legal_notice(
+                    sender_name=s_name,
+                    recipient_name=r_name,
+                    issue_summary=issue_summary,
+                    language=detected_lang,
+                    phone=phone
+                )
+
+                # Build response with download URL
+                if "[DOWNLOAD_URL:" in tool_result:
+                    if detected_lang == "ml":
+                        response_text = f"നിങ്ങളുടെ ഔപചാരിക ലീഗൽ നോട്ടീസ് ഡോക്യുമെന്റ് തയ്യാറാണ്. ദയവായി താഴെയുള്ള ലിങ്ക് ഉപയോഗിച്ച് ഡൗൺലോഡ് ചെയ്യുക.\n\n{tool_result}"
+                    else:
+                        response_text = f"Your formal legal notice document is ready for download.\n\n{tool_result}"
+                else:
+                    response_text = tool_result
+
+                return {
+                    "status": "SUCCESS",
+                    "response_text": response_text,
+                    "faithfulness_score": 1.0,
+                    "context": tool_result,
+                    "detected_language": detected_lang
+                }
+
         chat_messages.append({"role": "user", "content": normalized_query})
 
         # Execute ReAct Tool-Calling Agent Loop with graceful rate limit error handling
