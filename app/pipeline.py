@@ -653,10 +653,10 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
     def _verify_citation_grounding(self, response_text: str, retrieved_context: str) -> bool:
         """Post-generation statutory citation shield gate.
         Ensures section citations in the output exist in the retrieved database context."""
-        if not retrieved_context or "LEGAL ROADMAP" not in response_text:
+        if not retrieved_context or not response_text:
             return True
             
-        citations = re.findall(r'Section\s+\d+|സെക്ഷൻ\s+\d+', response_text, re.IGNORECASE)
+        citations = re.findall(r'(?:Section|സെക്ഷൻ|സെക്ഷ൯|ഭാഗം)\s+\d+', response_text, re.IGNORECASE)
         if not citations:
             return True
 
@@ -665,7 +665,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             if num_match:
                 sec_num = num_match.group(0)
                 if sec_num not in retrieved_context:
-                    logger.warning(f"Citation Shield Flagged: 'Section {sec_num}' cited in output but not found in retrieved context.")
+                    logger.warning(f"Citation Shield Flagged: '{cite}' cited in output but section number '{sec_num}' not found in retrieved context.")
                     return False
         return True
 
@@ -792,7 +792,9 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
         # Post-generation citation shield verification
         is_grounded = self._verify_citation_grounding(response_text, retrieved_context)
         if not is_grounded:
-            logger.warning("Statutory citation grounding check failed — sanitizing response.")
+            logger.warning("Statutory citation grounding check failed — sanitizing ungrounded statutory citations.")
+            # Strip out hallucinated section numbers and specific statute fabrications
+            response_text = re.sub(r'(?:Section|സെക്ഷൻ|സെക്ഷ൯|ഭാഗം)\s+\d+(?:\s*:[^,\.\n]+|\s+ഇന്ത്യൻ[^,\.\n]+|\s+[A-Z][a-zA-Z\s]+Act[^\n,\.]*)?', 'നിലവിലുള്ള ബന്ധപ്പെട്ട നിയമ വകുപ്പുകൾ പ്രകാരം', response_text, flags=re.IGNORECASE)
 
         # Guaranteed fallback response
         if not response_text or not response_text.strip():
