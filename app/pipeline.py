@@ -402,7 +402,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         if groq_api_key and groq_api_key.strip():
             model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
             url = "https://api.groq.com/openai/v1/chat/completions"
-            payload = {"model": model, "messages": full_messages, "temperature": temperature}
+            payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
             
             backoffs = [2, 4, 8]
             for attempt, sleep_sec in enumerate(backoffs, 1):
@@ -467,7 +467,9 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                     "messages": current_messages,
                     "tools": AGENT_TOOLS_SCHEMA,
                     "tool_choice": "auto",
-                    "temperature": 0.1
+                    "temperature": 0.2,
+                    "frequency_penalty": 0.6,
+                    "presence_penalty": 0.4
                 }
 
                 res_data = None
@@ -564,6 +566,72 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         final_content = self._call_llm_raw(system_prompt, current_messages)
         return {"content": final_content, "retrieved_context": retrieved_context}
 
+    def _clean_repetitive_output(self, text: str) -> str:
+        """Deduplicates repetitive sentences or looped phrases from LLM generation."""
+        if not text or len(text) < 20:
+            return text
+
+        # Split into lines/paragraphs first to preserve formatting structure
+        lines = text.split("\n")
+        cleaned_lines = []
+        seen_lines = set()
+
+        for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                cleaned_lines.append("")
+                continue
+
+            # Check sentence-level repetition within paragraph line
+            # Split by punctuation (Malayalam or English)
+            sentences = re.split(r'([.?!।\n]+)', line_str)
+            deduped_parts = []
+            seen_sentences = set()
+
+            i = 0
+            while i < len(sentences):
+                part = sentences[i]
+                if not part:
+                    i += 1
+                    continue
+
+                # If it's punctuation, append directly
+                if re.match(r'^[.?!।\n]+$', part):
+                    deduped_parts.append(part)
+                    i += 1
+                    continue
+
+                part_clean = re.sub(r'\s+', ' ', part).strip().lower()
+                # Ignore very short tokens (e.g. bullet symbols)
+                if len(part_clean) > 8:
+                    if part_clean in seen_sentences:
+                        i += 1
+                        # Skip attached trailing punctuation as well if next token is punct
+                        if i < len(sentences) and re.match(r'^[.?!।\n]+$', sentences[i]):
+                            i += 1
+                        continue
+                    seen_sentences.add(part_clean)
+                
+                deduped_parts.append(part)
+                i += 1
+
+            line_reconstructed = "".join(deduped_parts).strip()
+            line_key = line_reconstructed.lower()
+
+            # Skip whole repeated lines if line is a duplicate non-header line
+            if len(line_key) > 15 and line_key in seen_lines and not line_key.startswith("**"):
+                continue
+
+            if len(line_key) > 15:
+                seen_lines.add(line_key)
+
+            cleaned_lines.append(line_reconstructed)
+
+        result = "\n".join(cleaned_lines)
+        # Collapse multiple blank lines
+        result = re.sub(r'\n{3,}', '\n\n', result)
+        return result.strip()
+
     def _verify_citation_grounding(self, response_text: str, retrieved_context: str) -> bool:
         """Post-generation statutory citation shield gate.
         Ensures section citations in the output exist in the retrieved database context."""
@@ -599,13 +667,25 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
 
 CRITICAL BEHAVIORAL CONTRACT:
 1. You MUST respond strictly in {lang_name} language.
-2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr'), call tool 'draft_legal_notice(sender_name="vishnu", recipient_name="wex company hr", issue_summary=...)' IMMEDIATELY. DO NOT ask for names again when they are present in the text!
-3. Use the 'search_statutes' tool ONLY when the user describes an initial legal problem or asks about their rights/remedies without providing notice recipient details.
-4. When presenting initial legal rights, provide a structured assessment (ISSUE, RULE, APPLICATION, CONCLUSION, LAYPERSON ACTION GUIDE) based strictly on context retrieved by search_statutes.
-5. End legal assessments by asking the user if they want a formal legal notice drafted.
-6. If Sender or Recipient names are missing when drafting a notice, politely ask the user for the missing name(s) directly in {lang_name}.
+2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr'), call tool 'draft_legal_notice' IMMEDIATELY.
+3. Use the 'search_statutes' tool ONLY when the user describes an initial legal problem or asks about their rights/remedies.
+4. When presenting legal rights, you MUST use this EXACT structure — each section ONCE, no repetition:
+
+**ISSUE:** [1-2 sentences describing the user's problem]
+**RULE:** [Cite specific statute name and section number from retrieved context]
+**APPLICATION:** [How the statute applies to user's specific facts]
+**CONCLUSION:** [What the user is legally entitled to]
+**ACTION GUIDE:**
+1. [First concrete step]
+2. [Second concrete step]
+3. [Third concrete step]
+
+Would you like me to draft a formal legal notice?
+
+5. NEVER repeat the same sentence or idea twice. Each sentence must add NEW information.
+6. If Sender or Recipient names are missing when drafting a notice, politely ask for them in {lang_name}.
 7. NEVER fabricate statutory section numbers, addresses, or personal details.
-8. Keep responses concise, actionable, and warm.
+8. Keep responses concise (under 200 words), structured, and actionable.
 
 MALAYALAM LEGAL VOCABULARY MANDATES:
 When writing in Malayalam, you MUST strictly use these exact legal terms:
@@ -687,6 +767,9 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
             else:
                 response_text = "The AI service is temporarily busy. Please try again in 30 seconds."
             retrieved_context = ""
+
+        # Post-generation repetition cleanup
+        response_text = self._clean_repetitive_output(response_text)
 
         # Post-generation citation shield verification
         is_grounded = self._verify_citation_grounding(response_text, retrieved_context)
