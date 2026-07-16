@@ -75,6 +75,96 @@ MALAYALAM_MONTHS = {
     "ഒക്ടോബർ": "October", "നവംബർ": "November", "ഡിസംബർ": "December"
 }
 
+MALAYALAM_LEGAL_KEYWORDS = {
+    # Employment & Wages
+    "ശമ്പളം": "salary wages non payment compensation",
+    "വേതനം": "wages salary payment employment",
+    "തൊഴിലുടമ": "employer company management workplace",
+    "ജീവനക്കാരൻ": "employee worker employment rights",
+    "തൊഴിലാളി": "laborer worker employee wages",
+    "പിരിച്ചുവിട്ടു": "termination of employment unlawful dismissal notice",
+    # Tenancy & Eviction
+    "വാടക": "rent lease tenancy agreement",
+    "വീട്ടുടമസ്ഥൻ": "landlord house owner tenancy",
+    "വാടകക്കാരൻ": "tenant occupant residential tenancy",
+    "ഒഴിയാൻ": "eviction notice to quit eviction",
+    "മുറി": "rented room tenancy premises",
+    # Cheque & Financial
+    "ചെക്ക്": "cheque bounce dishonour section 138 negotiable instruments act",
+    "മടങ്ങി": "cheque bounce dishonour returned unpaid",
+    "കടം": "debt recovery financial loan",
+    # Consumer & Cybercrime
+    "ഉപഭോക്താവ്": "consumer protection rights defective product deficiency service",
+    "സൈബർ": "cybercrime fraud IT act unauthorized financial fraud",
+    "തട്ടിപ്പ്": "fraud cheating scam criminal breach of trust",
+    # General Civil & Domestic
+    "റാഗിംഗ്": "prohibition of ragging in educational institutions act",
+    "കരാർ": "breach of contract indian contract act compensation",
+    "അതിക്രമം": "trespass illegal entry assault tort liability"
+}
+
+class TokenBudgetManager:
+    """Sliding-window TPM rate-limit budget tracker for Groq free tier.
+    Tracks estimated token usage in Redis (or thread-safe memory fallback) per 60-second window.
+    Proactively redirects requests before reaching the 14,400 TPM threshold."""
+
+    def __init__(self, tpm_limit: int = 11500):
+        self.tpm_limit = tpm_limit
+        self.memory_usage = 0
+        self.last_reset = time.time()
+        self.redis_client = None
+
+        try:
+            import redis
+            self.redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True, socket_timeout=1.0)
+            self.redis_client.ping()
+            logger.info("✓ TokenBudgetManager connected to Redis for TPM budget tracking.")
+        except Exception:
+            self.redis_client = None
+            logger.info("TokenBudgetManager running with sliding in-memory TPM budget tracking.")
+
+    def estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return math.ceil(len(text) / 3.5)
+
+    def check_and_reserve(self, estimated_tokens: int) -> bool:
+        """Check if adding estimated_tokens will exceed TPM budget limit. Returns True if reserved, False if budget exceeded."""
+        now = time.time()
+        if self.redis_client:
+            try:
+                pipe = self.redis_client.pipeline()
+                pipe.get("groq_tpm_usage")
+                pipe.ttl("groq_tpm_usage")
+                res = pipe.execute()
+                current_used = int(res[0] or 0)
+                
+                if current_used + estimated_tokens > self.tpm_limit:
+                    logger.warning(f"Proactive Token Budget Gate Triggered: {current_used} + {estimated_tokens} > {self.tpm_limit} TPM limit. Diverting request.")
+                    return False
+
+                # Reserve tokens
+                pipe = self.redis_client.pipeline()
+                pipe.incrby("groq_tpm_usage", estimated_tokens)
+                if res[1] is None or res[1] < 0:
+                    pipe.expire("groq_tpm_usage", 60)
+                pipe.execute()
+                return True
+            except Exception as e:
+                logger.warning(f"Redis TPM check failed ({e}); using memory fallback.")
+
+        # In-memory sliding window fallback
+        if now - self.last_reset >= 60.0:
+            self.memory_usage = 0
+            self.last_reset = now
+
+        if self.memory_usage + estimated_tokens > self.tpm_limit:
+            logger.warning(f"Proactive Token Budget Gate Triggered (Memory): {self.memory_usage} + {estimated_tokens} > {self.tpm_limit} TPM. Diverting request.")
+            return False
+
+        self.memory_usage += estimated_tokens
+        return True
+
 def normalize_text_inputs(text: str) -> str:
     if not text:
         return text
@@ -169,8 +259,8 @@ class LegalMindPipeline:
                 self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=local_files_only)
             except Exception as e:
                 self.reranker = None
-        else:
-            self.reranker = None
+        # 4. Load Rate-Limit Token Budget Manager
+        self.token_budget_manager = TokenBudgetManager(tpm_limit=int(os.getenv("GROQ_TPM_LIMIT", "11500")))
 
     # --- TOOL 1: STATUTE RETRIEVAL ENGINE ---
     def search_statutes(self, query: str, jurisdiction: Optional[str] = None) -> str:
@@ -186,22 +276,31 @@ class LegalMindPipeline:
                     logger.info(f"Auto-resolved jurisdiction state '{state}' from city '{city}'")
                     break
 
-        # --- BUG 1 FIX: Dynamic LLM semantic query formulation for Qdrant Vector & Neo4j Graph Search ---
+        # --- PRIORITY 1: Robust Malayalam -> English Query Translation for Vector Retrieval ---
+        matched_en_terms = []
+        for ml_kw, en_terms in MALAYALAM_LEGAL_KEYWORDS.items():
+            if ml_kw in query:
+                matched_en_terms.append(en_terms)
+        domain_keywords_str = " ".join(matched_en_terms).strip()
+
         search_query_text = query
         if any(ord(c) > 127 for c in query):
             try:
+                translated_base = ""
                 if hasattr(self, 'translator') and self.translator:
                     inputs = self.translation_tokenizer(query, return_tensors="pt", padding=True, truncation=True)
                     translated = self.translation_model.generate(**inputs)
-                    translated_str = self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
-                    search_query_text = f"{translated_str} {jurisdiction or ''}".strip()
+                    translated_base = self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
                 else:
                     tr_prompt = f"Formulate a 1-sentence English semantic search query for Indian statutes & case precedents matching this user incident (e.g. consumer rights, cheque bounce, cybercrime, employment, tenancy, contract breach): {query}"
-                    search_query_text = self._call_llm_raw("You are a expert legal search query formulation system.", [{"role": "user", "content": tr_prompt}], temperature=0.0)
+                    translated_base = self._call_llm_raw("You are a expert legal search query formulation system.", [{"role": "user", "content": tr_prompt}], temperature=0.0)
+                
+                search_query_text = f"{translated_base} {domain_keywords_str} {jurisdiction or ''}".strip()
             except Exception as e:
-                logger.warning(f"Query formulation fallback to raw query: {e}")
+                logger.warning(f"Query formulation fallback to dictionary keywords: {e}")
+                search_query_text = f"{domain_keywords_str} {jurisdiction or ''}".strip() or query
         else:
-            search_query_text = f"{query} {jurisdiction or ''}".strip()
+            search_query_text = f"{query} {domain_keywords_str} {jurisdiction or ''}".strip()
 
         logger.info(f"Vector Retrieval Query Dynamically Formulated: '{search_query_text}'")
 
@@ -417,12 +516,24 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         groq_api_key = os.getenv("GROQ_API_KEY")
         
+        # Proactive Token Budget Check
+        est_tokens = self.token_budget_manager.estimate_tokens(system_prompt + json.dumps(messages))
+        under_budget = self.token_budget_manager.check_and_reserve(est_tokens)
+        
+        if not under_budget:
+            sec_key = os.getenv("GROQ_SECONDARY_API_KEY") or os.getenv("GROQ_API_KEY_FALLBACK")
+            if sec_key:
+                groq_api_key = sec_key
+                logger.info("Using secondary GROQ_API_KEY for request execution under budget limit.")
+            else:
+                groq_api_key = None  # Force local fallback
+
         if groq_api_key and groq_api_key.strip():
             model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
             url = "https://api.groq.com/openai/v1/chat/completions"
             payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
             
-            backoffs = [2, 4, 8]
+            backoffs = [2, 4, 8, 12]
             for attempt, sleep_sec in enumerate(backoffs, 1):
                 try:
                     req = urllib.request.Request(
@@ -789,12 +900,42 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
         # Post-generation repetition cleanup
         response_text = self._clean_repetitive_output(response_text)
 
-        # Post-generation citation shield verification
+        # Post-generation citation shield verification & active re-retrieval loop
         is_grounded = self._verify_citation_grounding(response_text, retrieved_context)
         if not is_grounded:
-            logger.warning("Statutory citation grounding check failed — sanitizing ungrounded statutory citations.")
-            # Strip out hallucinated section numbers and specific statute fabrications
-            response_text = re.sub(r'(?:Section|സെക്ഷൻ|സെക്ഷ൯|ഭാഗം)\s+\d+(?:\s*:[^,\.\n]+|\s+ഇന്ത്യൻ[^,\.\n]+|\s+[A-Z][a-zA-Z\s]+Act[^\n,\.]*)?', 'നിലവിലുള്ള ബന്ധപ്പെട്ട നിയമ വകുപ്പുകൾ പ്രകാരം', response_text, flags=re.IGNORECASE)
+            logger.warning("Statutory citation grounding check failed — executing active re-retrieval loop with refined domain terms.")
+            refined_query = f"{normalized_query} statutory employee rights jurisdiction"
+            second_context = self.search_statutes(query=refined_query)
+            
+            # Re-verify if second retrieval brought grounded statutory sections
+            if second_context and "Statute [" in second_context:
+                re_prompt = f"Synthesize a strict IRAC assessment for user in {lang_name} based ONLY on these verified statutes:\n{second_context}"
+                try:
+                    re_result = self._call_llm_raw(system_prompt, chat_messages + [{"role": "system", "content": re_prompt}], temperature=0.1)
+                    if self._verify_citation_grounding(re_result, second_context):
+                        response_text = re_result
+                        retrieved_context = second_context
+                        is_grounded = True
+                except Exception as re_err:
+                    logger.warning(f"Re-synthesis loop failed ({re_err}). Falling back to honest KeLSA guidance.")
+
+            # Honest legal aid emergency fallback if grounding still cannot be verified
+            if not is_grounded:
+                logger.warning("Statutory grounding still unverified — deploying honest official legal aid guidance.")
+                if detected_lang == "ml":
+                    response_text = (
+                        "നിങ്ങളുടെ കേസിന് ബാധകമായ വ്യക്തമായ നിയമവകുപ്പ് ഡാറ്റാബേസിൽ നിന്ന് കണ്ടെത്താൻ കഴിഞ്ഞില്ല. "
+                        "തെറ്റായ നിയമ ഉപദേശം ഒഴിവാക്കാൻ, സൗജന്യ ഔദ്യോഗിക നിയമ സഹായത്തിനായി കേരള ലീഗൽ സർവീസസ് അതോറിറ്റിയുമായി (KeLSA) ബന്ധപ്പെടാവുന്നതാണ്:\n\n"
+                        "📞 KeLSA ഹെൽപ്പ്‌ലൈൻ: 0471-2303122 / 15100\n\n"
+                        "നിങ്ങൾക്ക് ഈ വിഷയത്തിൽ എതിർകക്ഷിക്ക് ഒരു ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് അയക്കണോ?"
+                    )
+                else:
+                    response_text = (
+                        "Could not locate verified statutory provisions in the database for this specific incident. "
+                        "To prevent inaccurate advice, please contact the official Kerala Legal Services Authority (KeLSA) for free legal aid:\n\n"
+                        "📞 KeLSA Helpline: 0471-2303122 / 15100\n\n"
+                        "Would you like me to draft a formal legal notice to the opposing party?"
+                    )
 
         # Guaranteed fallback response
         if not response_text or not response_text.strip():
