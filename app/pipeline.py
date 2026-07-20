@@ -510,30 +510,42 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 f.write(html_content)
             return f"/api/documents/download?file={txt_filename}"
 
+    def _get_groq_api_keys(self) -> List[str]:
+        """Returns ordered list of valid configured Groq API keys for failover rotation."""
+        keys = []
+        p_key = os.getenv("GROQ_API_KEY")
+        s_key = os.getenv("GROQ_SECONDARY_API_KEY") or os.getenv("GROQ_API_KEY_FALLBACK")
+        if p_key and p_key.strip():
+            keys.append(p_key.strip())
+        if s_key and s_key.strip() and s_key.strip() not in keys:
+            keys.append(s_key.strip())
+        return keys
+
     # --- REACT AGENT LLM CALLING ENGINE ---
     def _call_llm_raw(self, system_prompt: str, messages: List[Dict[str, str]], temperature: float = 0.0) -> str:
-        """Low-level raw LLM completion helper with 429 backoff retry logic."""
+        """Low-level raw LLM completion helper with key failover and 429 backoff retry logic."""
         full_messages = [{"role": "system", "content": system_prompt}] + messages
-        groq_api_key = os.getenv("GROQ_API_KEY")
+        api_keys = self._get_groq_api_keys()
         
         # Proactive Token Budget Check
         est_tokens = self.token_budget_manager.estimate_tokens(system_prompt + json.dumps(messages))
         under_budget = self.token_budget_manager.check_and_reserve(est_tokens)
         
         if not under_budget:
-            sec_key = os.getenv("GROQ_SECONDARY_API_KEY") or os.getenv("GROQ_API_KEY_FALLBACK")
-            if sec_key:
-                groq_api_key = sec_key
-                logger.info("Using secondary GROQ_API_KEY for request execution under budget limit.")
+            # If over budget on primary key window, prioritize secondary key if present
+            if len(api_keys) > 1:
+                logger.info("Token budget gate limit reached on primary window. Rotating to secondary GROQ_API_KEY.")
+                api_keys = [api_keys[1], api_keys[0]]
             else:
-                groq_api_key = None  # Force local fallback
+                logger.warning("Token budget limit reached and no secondary key found. Forcing local fallback.")
+                api_keys = []
 
-        if groq_api_key and groq_api_key.strip():
-            model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
-            
-            backoffs = [2, 4, 8, 12]
+        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
+
+        for key_idx, current_key in enumerate(api_keys):
+            backoffs = [1, 2, 4]
             for attempt, sleep_sec in enumerate(backoffs, 1):
                 try:
                     req = urllib.request.Request(
@@ -541,7 +553,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                         data=json.dumps(payload).encode('utf-8'),
                         headers={
                             'Content-Type': 'application/json',
-                            'Authorization': f'Bearer {groq_api_key}',
+                            'Authorization': f'Bearer {current_key}',
                             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
                         },
                         method='POST'
@@ -551,7 +563,10 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                         return data["choices"][0]["message"]["content"].strip()
                 except urllib.error.HTTPError as e:
                     if e.code == 429:
-                        logger.warning(f"Groq 429 Rate Limited. Sleeping {sleep_sec}s (attempt {attempt})...")
+                        logger.warning(f"Groq key [{key_idx + 1}/{len(api_keys)}] hit 429 Rate Limit.")
+                        if key_idx + 1 < len(api_keys):
+                            logger.info(f"Failing over to secondary Groq API key...")
+                            break  # Break attempt loop to switch to next key immediately
                         time.sleep(sleep_sec)
                     else:
                         logger.warning(f"Groq raw LLM call failed with HTTP {e.code}: {e}")
@@ -573,10 +588,10 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             raise LLMUnavailableError(f"All LLM backends unreachable: {e}")
 
     def _call_agent_with_tools(self, system_prompt: str, messages: List[Dict[str, Any]], phone: str = "", language: str = "en") -> Dict[str, Any]:
-        """Core ReAct Agent loop using OpenAI/Groq standard tool calling schemas with rate-limit retries."""
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        if not groq_api_key or not groq_api_key.strip():
-            logger.warning("GROQ_API_KEY missing. Running agent in non-tool fallback mode.")
+        """Core ReAct Agent loop using OpenAI/Groq standard tool calling schemas with rate-limit retries and key failover."""
+        api_keys = self._get_groq_api_keys()
+        if not api_keys:
+            logger.warning("No valid GROQ_API_KEY configured. Running agent in non-tool fallback mode.")
             content = self._call_llm_raw(system_prompt, messages)
             return {"content": content, "retrieved_context": ""}
 
@@ -602,33 +617,42 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 }
 
                 res_data = None
-                backoffs = [2, 4, 8]
-                for attempt, sleep_sec in enumerate(backoffs, 1):
-                    try:
-                        req = urllib.request.Request(
-                            groq_url,
-                            data=json.dumps(payload).encode('utf-8'),
-                            headers={
-                                'Content-Type': 'application/json',
-                                'Authorization': f'Bearer {groq_api_key}',
-                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                            },
-                            method='POST'
-                        )
-                        with urllib.request.urlopen(req, timeout=30) as response:
-                            res_data = json.loads(response.read().decode('utf-8'))
-                            break
-                    except urllib.error.HTTPError as e:
-                        if e.code == 429:
-                            logger.warning(f"Groq API 429 Rate Limit hit. Retrying in {sleep_sec}s...")
-                            time.sleep(sleep_sec)
-                        else:
-                            logger.error(f"Groq API HTTP Error {e.code}: {e}")
-                            break
-                    except Exception as e:
-                        logger.warning(f"Groq tool-calling request attempt {attempt} failed: {e}")
-                        if attempt < len(backoffs):
-                            time.sleep(2)
+                key_success = False
+                
+                for key_idx, current_key in enumerate(api_keys):
+                    backoffs = [1, 2, 4]
+                    for attempt, sleep_sec in enumerate(backoffs, 1):
+                        try:
+                            req = urllib.request.Request(
+                                groq_url,
+                                data=json.dumps(payload).encode('utf-8'),
+                                headers={
+                                    'Content-Type': 'application/json',
+                                    'Authorization': f'Bearer {current_key}',
+                                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                                },
+                                method='POST'
+                            )
+                            with urllib.request.urlopen(req, timeout=30) as response:
+                                res_data = json.loads(response.read().decode('utf-8'))
+                                key_success = True
+                                break
+                        except urllib.error.HTTPError as e:
+                            if e.code == 429:
+                                logger.warning(f"Groq API key [{key_idx + 1}/{len(api_keys)}] 429 Rate Limit hit.")
+                                if key_idx + 1 < len(api_keys):
+                                    logger.info("Failing over to secondary Groq API key for tool calling...")
+                                    break  # Failover to secondary key immediately
+                                time.sleep(sleep_sec)
+                            else:
+                                logger.error(f"Groq API HTTP Error {e.code}: {e}")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Groq tool-calling request attempt {attempt} failed: {e}")
+                            if attempt < len(backoffs):
+                                time.sleep(2)
+                    if key_success:
+                        break
 
                 if not res_data:
                     break
