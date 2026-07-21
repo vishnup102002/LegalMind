@@ -915,11 +915,23 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
             retrieved_context = result.get("retrieved_context", "")
         except Exception as e:
             logger.error(f"ReAct agent loop execution failed: {e}")
+            fallback_statutes = ""
+            try:
+                fallback_statutes = self.search_statutes(query=normalized_query)
+            except Exception:
+                pass
+
             if detected_lang == "ml":
-                response_text = "സേവനം താൽക്കാലികമായി തിരക്കിലാണ്. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
+                if fallback_statutes and "Statute [" in fallback_statutes:
+                    response_text = f"സേവനം നിലവിൽ ഉയർന്ന ആവശ്യകതയിലാണ്. നിങ്ങളുടെ വിഷയവുമായി ബന്ധപ്പെട്ട പ്രധാന നിയമ വകുപ്പുകൾ താഴെ നൽകുന്നു:\n\n{fallback_statutes[:400]}\n\nകൂടുതൽ സൗജന്യ നിയമ സഹായത്തിന് KeLSA ഹെൽപ്പ്‌ലൈനുമായി (15100 / 0471-2303122) ബന്ധപ്പെടുക."
+                else:
+                    response_text = "സേവനം നിലവിൽ ഉയർന്ന ആവശ്യകതയിലാണ്. സൗജന്യ ഔദ്യോഗിക നിയമ സഹായത്തിനായി കേരള ലീഗൽ സർവീസസ് അതോറിറ്റി (KeLSA) ഹെൽപ്പ്‌ലൈനുമായി (15100 / 0471-2303122) ബന്ധപ്പെടാവുന്നതാണ്."
             else:
-                response_text = "The AI service is temporarily busy. Please try again in 30 seconds."
-            retrieved_context = ""
+                if fallback_statutes and "Statute [" in fallback_statutes:
+                    response_text = f"The AI service is experiencing high demand. Key statutory provisions relevant to your query:\n\n{fallback_statutes[:400]}\n\nFor free official legal aid, contact the KeLSA Helpline (15100)."
+                else:
+                    response_text = "The AI service is experiencing high demand. For free official legal aid, please contact the Kerala State Legal Services Authority (KeLSA) Helpline at 15100 / 0471-2303122."
+            retrieved_context = fallback_statutes
 
         # Post-generation repetition cleanup
         response_text = self._clean_repetitive_output(response_text)
