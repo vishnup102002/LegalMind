@@ -422,7 +422,9 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         
         try:
             draft_messages = [{"role": "user", "content": draft_prompt}]
-            draft = self._call_llm_raw("You are an Indian legal notice drafting system.", draft_messages, temperature=0.2)
+            draft = self._call_llm_raw("You are an Indian legal notice drafting system.", draft_messages, temperature=0.1)
+            # Deduplicate repetitive sentence loops from LLM synthesis
+            draft = self._clean_repetitive_output(draft)
         except Exception as e:
             logger.error(f"Failed to generate notice draft text: {e}")
             draft = f"FORMAL LEGAL NOTICE\n\nTo: {recipient_name}\nFrom: {sender_name}\n\nSubject: DEMAND FOR REMEDIAL ACTION\n\n1. Facts: {issue_summary}\n2. Statutory Ground: {statutes_cited}"
@@ -474,7 +476,8 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         <html>
         <head>
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 30px; line-height: 1.6; color: #111; }}
+                @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Malayalam:wght@400;700&display=swap');
+                body {{ font-family: 'Noto Sans Malayalam', 'Noto Sans', 'Lohit Malayalam', Arial, sans-serif; margin: 30px; line-height: 1.6; color: #111; }}
                 .header {{ text-align: center; font-weight: bold; font-size: 22px; text-decoration: underline; margin-bottom: 30px; }}
                 .meta {{ margin-bottom: 20px; font-size: 14px; }}
                 .content {{ white-space: pre-wrap; font-size: 14px; text-align: justify; }}
