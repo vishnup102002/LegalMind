@@ -573,13 +573,12 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 logger.warning("Token budget limit reached and no secondary key found. Forcing local fallback.")
                 api_keys = []
 
-        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        groq_models = [os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"), "llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"]
         url = "https://api.groq.com/openai/v1/chat/completions"
-        payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
 
-        for key_idx, current_key in enumerate(api_keys):
-            backoffs = [2, 5, 15] if len(api_keys) == 1 else [1, 2, 4]
-            for attempt, sleep_sec in enumerate(backoffs, 1):
+        for target_model in groq_models:
+            payload = {"model": target_model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
+            for key_idx, current_key in enumerate(api_keys):
                 try:
                     req = urllib.request.Request(
                         url,
@@ -596,18 +595,14 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                         return data["choices"][0]["message"]["content"].strip()
                 except urllib.error.HTTPError as e:
                     if e.code == 429:
-                        logger.warning(f"Groq key [{key_idx + 1}/{len(api_keys)}] hit 429 Rate Limit.")
-                        if key_idx + 1 < len(api_keys):
-                            logger.info(f"Failing over to secondary Groq API key...")
-                            break  # Break attempt loop to switch to next key immediately
-                        time.sleep(sleep_sec)
+                        logger.warning(f"Groq model '{target_model}' key [{key_idx + 1}/{len(api_keys)}] hit 429 Rate Limit. Rotating model/key...")
+                        continue
                     else:
                         logger.warning(f"Groq raw LLM call failed with HTTP {e.code}: {e}")
                         break
                 except Exception as e:
                     logger.warning(f"Groq raw LLM call failed: {e}")
-                    if attempt < len(backoffs):
-                        time.sleep(2)
+                    continue
 
         # Local Ollama fallback
         url = "http://localhost:11434/api/chat"
@@ -621,7 +616,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             raise LLMUnavailableError(f"All LLM backends unreachable: {e}")
 
     def _call_agent_with_tools(self, system_prompt: str, messages: List[Dict[str, Any]], phone: str = "", language: str = "en") -> Dict[str, Any]:
-        """Core ReAct Agent loop using OpenAI/Groq standard tool calling schemas with rate-limit retries and key failover."""
+        """Core ReAct Agent loop using OpenAI/Groq standard tool calling schemas with rate-limit retries, key failover, and model rotation."""
         api_keys = self._get_groq_api_keys()
         if not api_keys:
             logger.warning("No valid GROQ_API_KEY configured. Running agent in non-tool fallback mode.")
@@ -629,7 +624,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             return {"content": content, "retrieved_context": ""}
 
         groq_url = "https://api.groq.com/openai/v1/chat/completions"
-        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        groq_models = [os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"), "llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"]
         
         current_messages = [{"role": "system", "content": system_prompt}] + messages
         retrieved_context = ""
@@ -639,22 +634,21 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
 
         while step < MAX_TOOL_STEPS:
             try:
-                payload = {
-                    "model": model,
-                    "messages": current_messages,
-                    "tools": AGENT_TOOLS_SCHEMA,
-                    "tool_choice": "auto",
-                    "temperature": 0.2,
-                    "frequency_penalty": 0.6,
-                    "presence_penalty": 0.4
-                }
-
                 res_data = None
                 key_success = False
-                
-                for key_idx, current_key in enumerate(api_keys):
-                    backoffs = [2, 5, 15] if len(api_keys) == 1 else [1, 2, 4]
-                    for attempt, sleep_sec in enumerate(backoffs, 1):
+
+                for target_model in groq_models:
+                    payload = {
+                        "model": target_model,
+                        "messages": current_messages,
+                        "tools": AGENT_TOOLS_SCHEMA,
+                        "tool_choice": "auto",
+                        "temperature": 0.2,
+                        "frequency_penalty": 0.6,
+                        "presence_penalty": 0.4
+                    }
+                    
+                    for key_idx, current_key in enumerate(api_keys):
                         try:
                             req = urllib.request.Request(
                                 groq_url,
@@ -672,18 +666,13 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                                 break
                         except urllib.error.HTTPError as e:
                             if e.code == 429:
-                                logger.warning(f"Groq API key [{key_idx + 1}/{len(api_keys)}] 429 Rate Limit hit.")
-                                if key_idx + 1 < len(api_keys):
-                                    logger.info("Failing over to secondary Groq API key for tool calling...")
-                                    break  # Failover to secondary key immediately
-                                time.sleep(sleep_sec)
+                                logger.warning(f"Groq tool-calling model '{target_model}' key [{key_idx + 1}/{len(api_keys)}] hit 429 Rate Limit. Rotating...")
+                                continue
                             else:
                                 logger.error(f"Groq API HTTP Error {e.code}: {e}")
                                 break
                         except Exception as e:
-                            logger.warning(f"Groq tool-calling request attempt {attempt} failed: {e}")
-                            if attempt < len(backoffs):
-                                time.sleep(2)
+                            logger.warning(f"Groq tool-calling request attempt failed: {e}")
                     if key_success:
                         break
 
