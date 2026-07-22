@@ -168,8 +168,7 @@ class TokenBudgetManager:
 def normalize_text_inputs(text: str) -> str:
     if not text:
         return text
-    for ml, en in MALAYALAM_TO_ENGLISH_CITIES.items():
-        text = text.replace(ml, en)
+    # Preserve original Malayalam city names to prevent LLM translation hallucinations (e.g. Kochi -> Kozhikode)
     for ml, en in MALAYALAM_MONTHS.items():
         text = text.replace(ml, en)
     return text
@@ -854,14 +853,14 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
 
 CRITICAL BEHAVIORAL CONTRACT:
 1. You MUST respond strictly in {lang_name} language.
-2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr'), call tool 'draft_legal_notice' IMMEDIATELY.
+2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr' or 'ഫ്രം: വിഷ്ണു, ടൂ: wex hr'), call tool 'draft_legal_notice' IMMEDIATELY.
 3. Use the 'search_statutes' tool ONLY when the user describes an initial legal problem or asks about their rights/remedies.
 4. When presenting legal rights, you MUST use this EXACT structure — each section ONCE, no repetition:
 
 **ISSUE:** [1-2 sentences describing the user's problem]
 **RULE:** [Cite specific statute name and section number from retrieved context]
 **APPLICATION:** [How the statute applies to user's specific facts]
-**CONCLUSION:** [What the user is legally entitled to]
+**CONCLUSION:** [What the user may legally be entitled to]
 **ACTION GUIDE:**
 1. [First concrete step]
 2. [Second concrete step]
@@ -869,10 +868,12 @@ CRITICAL BEHAVIORAL CONTRACT:
 
 Would you like me to draft a formal legal notice?
 
-5. NEVER repeat the same sentence or idea twice. Each sentence must add NEW information.
-6. If Sender or Recipient names are missing when drafting a notice, politely ask for them in {lang_name}.
-7. NEVER fabricate statutory section numbers, addresses, or personal details.
-8. Keep responses concise (under 200 words), structured, and actionable.
+5. STRICT FACT ANCHORING: NEVER alter, swap, or hallucinate user-provided facts, names, or locations (e.g., if the user says 'കൊച്ചി' / 'Kochi', keep it strictly as Kochi — NEVER change it to Kozhikode or any other location!).
+6. PROBABILISTIC LEGAL ADVISORY: NEVER make absolute guarantees or promises like 'നിങ്ങൾക്ക് ലഭിക്കും' ('You WILL get compensation'). Always use cautious, legally accurate probabilistic phrases like 'നിങ്ങൾക്ക് അർഹതയുണ്ടായേക്കാം' ('You MAY be entitled to') or 'നിയമപരമായ പരിഹാരം തേടാവുന്നതാണ്' ('Legal remedies may be pursued'). No AI can guarantee legal outcomes.
+7. NEVER repeat the same sentence or idea twice. Each sentence must add NEW information.
+8. If Sender or Recipient names are missing when drafting a notice, politely ask for them in {lang_name}.
+9. NEVER fabricate statutory section numbers, addresses, or personal details.
+10. Keep responses concise (under 200 words), structured, and actionable.
 
 MALAYALAM LEGAL VOCABULARY MANDATES:
 When writing in Malayalam, you MUST strictly use these exact legal terms:
@@ -899,8 +900,8 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
         # --- Deterministic Name Extraction & Direct Tool Call ---
         # If user provides explicit sender/recipient names, bypass LLM and call tool directly.
         # This eliminates LLM flakiness for notice generation when names are clearly provided.
-        sender_match = re.search(r'(?:അയക്കുന്നയാൾ|sender|from)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
-        recipient_match = re.search(r'(?:ലഭിക്കേണ്ടയാൾ|recipient|to)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        sender_match = re.search(r'(?:അയക്കുന്നയാൾ|ഫ്രം|sender|from|complainant)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        recipient_match = re.search(r'(?:ലഭിക്കേണ്ടയാൾ|സ്വീകരിക്കുന്നയാൾ|എതിർകക്ഷി|ടൂ|to|recipient|respondent)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
         
         if sender_match and recipient_match:
             s_name = sender_match.group(1).strip()
@@ -949,23 +950,11 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
             retrieved_context = result.get("retrieved_context", "")
         except Exception as e:
             logger.error(f"ReAct agent loop execution failed: {e}")
-            fallback_statutes = ""
-            try:
-                fallback_statutes = self.search_statutes(query=normalized_query)
-            except Exception:
-                pass
-
             if detected_lang == "ml":
-                if fallback_statutes and "Statute [" in fallback_statutes:
-                    response_text = f"സേവനം നിലവിൽ ഉയർന്ന ആവശ്യകതയിലാണ്. നിങ്ങളുടെ വിഷയവുമായി ബന്ധപ്പെട്ട പ്രധാന നിയമ വകുപ്പുകൾ താഴെ നൽകുന്നു:\n\n{fallback_statutes[:400]}\n\nകൂടുതൽ സൗജന്യ നിയമ സഹായത്തിന് KeLSA ഹെൽപ്പ്‌ലൈനുമായി (15100 / 0471-2303122) ബന്ധപ്പെടുക."
-                else:
-                    response_text = "സേവനം നിലവിൽ ഉയർന്ന ആവശ്യകതയിലാണ്. സൗജന്യ ഔദ്യോഗിക നിയമ സഹായത്തിനായി കേരള ലീഗൽ സർവീസസ് അതോറിറ്റി (KeLSA) ഹെൽപ്പ്‌ലൈനുമായി (15100 / 0471-2303122) ബന്ധപ്പെടാവുന്നതാണ്."
+                response_text = "സേവനം നിലവിൽ ഉയർന്ന ആവശ്യകതയിലാണ്. ദയവായി കുറച്ചു സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.\n\n📞 ഉടൻ സൗജന്യ നിയമ സഹായത്തിന് കേരള ലീഗൽ സർവീസസ് അതോറിറ്റി (KeLSA) ഹെൽപ്പ്‌ലൈനുമായി (15100 / 0471-2303122) ബന്ധപ്പെടാവുന്നതാണ്."
             else:
-                if fallback_statutes and "Statute [" in fallback_statutes:
-                    response_text = f"The AI service is experiencing high demand. Key statutory provisions relevant to your query:\n\n{fallback_statutes[:400]}\n\nFor free official legal aid, contact the KeLSA Helpline (15100)."
-                else:
-                    response_text = "The AI service is experiencing high demand. For free official legal aid, please contact the Kerala State Legal Services Authority (KeLSA) Helpline at 15100 / 0471-2303122."
-            retrieved_context = fallback_statutes
+                response_text = "The AI service is currently experiencing high demand. Please try again in a few moments.\n\n📞 For immediate free legal assistance, contact the Kerala State Legal Services Authority (KeLSA) Helpline at 15100 / 0471-2303122."
+            retrieved_context = ""
 
         # Post-generation repetition cleanup
         response_text = self._clean_repetitive_output(response_text)
