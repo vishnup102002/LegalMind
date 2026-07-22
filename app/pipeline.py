@@ -427,7 +427,32 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             draft = self._clean_repetitive_output(draft)
         except Exception as e:
             logger.error(f"Failed to generate notice draft text: {e}")
-            draft = f"FORMAL LEGAL NOTICE\n\nTo: {recipient_name}\nFrom: {sender_name}\n\nSubject: DEMAND FOR REMEDIAL ACTION\n\n1. Facts: {issue_summary}\n2. Statutory Ground: {statutes_cited}"
+            # Template-based fallback — no LLM dependency
+            if language == "ml":
+                draft = (
+                    f"ഔദ്യോഗിക നിയമ നോട്ടീസ്\n\n"
+                    f"തീയതി: {notice_date}\n"
+                    f"അയക്കുന്നയാൾ (Complainant): {sender_name}\n"
+                    f"സ്വീകരിക്കുന്നയാൾ / എതിർകക്ഷി (Respondent): {recipient_name}\n\n"
+                    f"വിഷയം: {sender_name} മുഖേന {recipient_name} ക്ക് അയക്കുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസ്\n\n"
+                    f"1. വസ്തുതകൾ (Statement of Facts):\n{issue_summary}\n\n"
+                    f"2. നിയമപരമായ അടിസ്ഥാനം (Legal Ground):\n{statutes_cited or 'ബാധകമായ ഇന്ത്യൻ സിവിൽ നിയമങ്ങൾ'}\n\n"
+                    f"3. ആവശ്യം (Demand):\nമേൽപ്പറഞ്ഞ പ്രശ്നത്തിന് ഈ നോട്ടീസ് ലഭിച്ച് 15 ദിവസത്തിനകം പരിഹാരം കാണണമെന്ന് ആവശ്യപ്പെടുന്നു.\n\n"
+                    f"4. മുന്നറിയിപ്പ് (Consequence):\nനിശ്ചിത സമയത്തിനകം പ്രതികരിക്കാത്ത പക്ഷം ഉചിതമായ നിയമ നടപടി സ്വീകരിക്കുന്നതാണ്.\n\n"
+                    f"സൗജന്യ നിയമ സഹായം: KeLSA ഹെൽപ്പ്‌ലൈൻ 15100 / 0471-2303122"
+                )
+            else:
+                draft = (
+                    f"FORMAL LEGAL NOTICE\n\n"
+                    f"Date: {notice_date}\n"
+                    f"From (Complainant): {sender_name}\n"
+                    f"To (Respondent): {recipient_name}\n\n"
+                    f"Subject: Legal Notice from {sender_name} to {recipient_name}\n\n"
+                    f"1. Statement of Facts:\n{issue_summary}\n\n"
+                    f"2. Legal Ground:\n{statutes_cited or 'Applicable Indian Civil Statutes'}\n\n"
+                    f"3. Demand:\nRemedial action is hereby demanded within 15 days of receipt of this notice.\n\n"
+                    f"4. Consequence:\nFailure to comply shall result in appropriate legal proceedings without further notice."
+                )
 
         # Reject broken/corrupted draft text containing empty brackets or minimal words
         bracket_count = draft.count("[ ]") + draft.count(". .")
@@ -548,7 +573,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         payload = {"model": model, "messages": full_messages, "temperature": temperature, "frequency_penalty": 0.6, "presence_penalty": 0.4}
 
         for key_idx, current_key in enumerate(api_keys):
-            backoffs = [1, 2, 4]
+            backoffs = [2, 5, 15] if len(api_keys) == 1 else [1, 2, 4]
             for attempt, sleep_sec in enumerate(backoffs, 1):
                 try:
                     req = urllib.request.Request(
@@ -623,7 +648,7 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 key_success = False
                 
                 for key_idx, current_key in enumerate(api_keys):
-                    backoffs = [1, 2, 4]
+                    backoffs = [2, 5, 15] if len(api_keys) == 1 else [1, 2, 4]
                     for attempt, sleep_sec in enumerate(backoffs, 1):
                         try:
                             req = urllib.request.Request(
