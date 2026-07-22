@@ -254,10 +254,12 @@ class LegalMindPipeline:
         self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=local_files_only)
         
         # 3. Load Reranker
+        self.reranker = None
         if os.getenv("ENABLE_RERANKER", "True").lower() == "true":
             try:
                 self.reranker = CrossEncoder("BAAI/bge-reranker-base", local_files_only=local_files_only)
             except Exception as e:
+                logger.warning(f"Reranker loading failed (running without reranker): {e}")
                 self.reranker = None
         # 4. Load Rate-Limit Token Budget Manager
         self.token_budget_manager = TokenBudgetManager(tpm_limit=int(os.getenv("GROQ_TPM_LIMIT", "11500")))
@@ -338,12 +340,16 @@ class LegalMindPipeline:
             })
 
         # Apply BGE-Reranker filtering if available
-        if self.reranker and retrieved_contexts:
-            pairs = [(query, doc["text"]) for doc in retrieved_contexts]
-            scores = self.reranker.predict(pairs)
-            for idx, doc in enumerate(retrieved_contexts):
-                doc["relevance_score"] = float(scores[idx])
-            retrieved_contexts.sort(key=lambda x: x["relevance_score"], reverse=True)
+        reranker_obj = getattr(self, 'reranker', None)
+        if reranker_obj and retrieved_contexts:
+            try:
+                pairs = [(query, doc["text"]) for doc in retrieved_contexts]
+                scores = reranker_obj.predict(pairs)
+                for idx, doc in enumerate(retrieved_contexts):
+                    doc["relevance_score"] = float(scores[idx])
+                retrieved_contexts.sort(key=lambda x: x["relevance_score"], reverse=True)
+            except Exception as r_err:
+                logger.warning(f"Reranking step failed gracefully: {r_err}")
 
         formatted_output = []
         for i, doc in enumerate(retrieved_contexts[:3], 1):
