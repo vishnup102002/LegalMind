@@ -534,6 +534,7 @@ def send_whatsapp_response(to: str, text: str, session: dict, modality: str = "t
     - If input modality is text: sends text reply, plus document attachment if present."""
     import shutil
     
+    to = str(to or "whatsapp:+14155238886")
     phone_number = to.replace("whatsapp:", "")
     is_voice = (modality == "voice")
     
@@ -789,7 +790,7 @@ async def whatsapp_webhook(
                 whatsapp_reply = f"{base_note}\n\n📥 **Download Link (PDF):**\n{download_url}"
 
         # 6. Unified send: text + TTS audio (for voice) + document (if any)
-        send_whatsapp_response(From, whatsapp_reply, session, modality=current_modality, download_url=download_url)
+        send_whatsapp_response(raw_from, whatsapp_reply, session, modality=current_modality, download_url=download_url)
 
         # 7. Update and save session history
         history.append({"role": "user", "text": user_message})
@@ -798,14 +799,14 @@ async def whatsapp_webhook(
         session_manager.save(phone_number, session)
         
     except LLMUnavailableError:
-        logger.error(f"LLM backends unreachable for {From}", exc_info=True)
+        logger.error(f"LLM backends unreachable for {raw_from}", exc_info=True)
         if session.get("lang") == "ml":
             error_msg = "ക്ഷമിക്കണം, AI സേവനം താൽക്കാലികമായി ലഭ്യമല്ല. ദയവായി 30 സെക്കൻഡ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
         else:
             error_msg = "Sorry, the AI service is temporarily unavailable due to high demand. Please try again in 30 seconds."
-        send_whatsapp_response(From, error_msg, session)
+        send_whatsapp_response(raw_from, error_msg, session)
     except Exception as e:
-        logger.error(f"Error processing pipeline run for {From}: {e}", exc_info=True)
+        logger.error(f"Error processing pipeline run for {raw_from}: {e}", exc_info=True)
         # Provide a specific error message in SESSION LANGUAGE ONLY
         error_str = str(e).lower()
         is_ml = session.get("lang") == "ml"
@@ -829,7 +830,7 @@ async def whatsapp_webhook(
                 error_msg = "ക്ഷമിക്കണം, ഒരു അപ്രതീക്ഷിത പിശക് സംഭവിച്ചു. ദയവായി വീണ്ടും ശ്രമിക്കുക അല്ലെങ്കിൽ /reset അയക്കുക."
             else:
                 error_msg = "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
-        send_whatsapp_response(From, error_msg, session)
+        send_whatsapp_response(raw_from, error_msg, session)
 
     s_name = result.get("sender_name") if isinstance(result, dict) else None
     r_name = result.get("recipient_name") if isinstance(result, dict) else None
