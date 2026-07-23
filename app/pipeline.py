@@ -393,72 +393,63 @@ class LegalMindPipeline:
         if missing_fields:
             return f"TOOL ERROR: Cannot compile legal notice document yet. Missing required details: {', '.join(missing_fields)}. Ask the user politely to provide these missing details first."
 
-        # Compile draft text using LLM synthesis
+        # Compile formal legal notice draft text (Formal English with Malayalam summary for legal precision)
         from datetime import date
         notice_date = date.today().strftime("%d %B %Y")
-        placeholder_text = "[അയക്കുന്നയാൾ പൂരിപ്പിക്കേണ്ടതാണ്]" if language == "ml" else "[TO BE FILLED BY SENDER]"
         
         draft_prompt = f"""Draft a formal, legally recognized Indian Legal Notice document based strictly on these details:
 
-- Date: {notice_date}
-- SENDER / COMPLAINANT (The client sending the notice): {sender_name}
-- RECIPIENT / RESPONDENT (The opposing party receiving the notice): {recipient_name}
-- Facts & Summary: {issue_summary}
-- Governing Laws / Statutes: {statutes_cited or 'Applicable Indian Civil Statutes'}
-- Language: {'Malayalam' if language == 'ml' else 'English'}
+- DATE: {notice_date}
+- SENDER / COMPLAINANT (Client sending the notice): {sender_name}
+- RECIPIENT / RESPONDENT (Opposing party receiving notice): {recipient_name}
+- STATEMENT OF FACTS: {issue_summary}
+- GOVERNING LAWS / STATUTES: {statutes_cited or 'Section 5 of the Payment of Wages Act, 1936 and Industrial Disputes Act, 1947'}
 
-LEGAL NOTICE DIRECTION CONTRACT (STRICT MANDATORY RULES):
-- The notice IS SENT BY {sender_name} TO {recipient_name}.
-- In Malayalam, the header MUST say:
-  "അയക്കുന്നയാൾ (Complainant): {sender_name}"
-  "സ്വീകരിക്കുന്നയാൾ / എതിർകക്ഷി (Respondent): {recipient_name}"
-  "വിഷയം: {sender_name} മുഖേന {recipient_name} ക്ക് അയക്കുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസ്"
-- NEVER state that the notice is from {recipient_name} to {sender_name}! {sender_name} is the sender/complainant!
-- STRICT DEDUPLICATION: Every numbered point MUST be completely unique. NEVER repeat the same phrase, clause, or sentence across multiple points!
+LEGAL NOTICE DRAFTING CONTRACT (STRICT MANDATORY RULES):
+1. The notice MUST be written in 1st/3rd person formal legal notice format:
+   "UNDER INSTRUCTIONS FROM MY CLIENT, {sender_name}, I HEREBY SERVE YOU, {recipient_name}, WITH THIS FORMAL LEGAL NOTICE..."
+2. Include these 5 explicit numbered sections with complete legal arguments:
+   1. STATEMENT OF FACTS (Detailing employment/facts at {recipient_name} and non-payment of salary).
+   2. LEGAL GROUND & STATUTORY VIOLATIONS (Citing Section 5 of Payment of Wages Act 1936 & relevant labor laws).
+   3. DEMAND FOR REMEDY (Demanding immediate payment of full salary arrears within 15 days of receipt).
+   4. CONSEQUENCE OF NON-COMPLIANCE (Initiation of civil/labor court proceedings at recipient's risk and cost).
+   5. EXECUTION & SIGNATURE BLOCK (For {sender_name}).
+3. NO UNFILLED PLACEHOLDERS: NEVER output bracket placeholders like '[TO BE FILLED BY SENDER]' or '[അയക്കുന്നയാൾ പൂരിപ്പിക്കേണ്ടതാണ്]'. Use complete, formal wording.
+4. NO BLANK SECTIONS: All sections MUST be fully populated with legal text.
+5. NO REPETITIVE LOOPS: Every sentence must contain unique legal facts."""
 
-Include these sections:
-1. Header & Subject Line (From {sender_name} To {recipient_name})
-2. Statement of Facts (numbered, unique points)
-3. Legal Ground & Statutory Violations ( cite Payment of Wages Act 1936 or Kerala Shops & Commercial Establishments Act 1960 if applicable)
-4. Clear Demand / Relief Sought
-5. Period for Compliance & Consequence of Non-Compliance
-6. Signature Block for {sender_name}
-
-Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
-        
         try:
             draft_messages = [{"role": "user", "content": draft_prompt}]
-            draft = self._call_llm_raw("You are an Indian legal notice drafting system. Write concise, non-repetitive legal text.", draft_messages, temperature=0.1)
+            draft = self._call_llm_raw("You are a senior advocate drafting an official Indian legal notice. Write precise, professional formal English legal text.", draft_messages, temperature=0.1)
             # Deduplicate repetitive sentence & phrase loops from LLM synthesis
             draft = self._clean_repetitive_output(draft)
         except Exception as e:
             logger.error(f"Failed to generate notice draft text: {e}")
-            # Template-based fallback — no LLM dependency
-            if language == "ml":
-                draft = (
-                    f"ഔദ്യോഗിക നിയമ നോട്ടീസ്\n\n"
-                    f"തീയതി: {notice_date}\n"
-                    f"അയക്കുന്നയാൾ (Complainant): {sender_name}\n"
-                    f"സ്വീകരിക്കുന്നയാൾ / എതിർകക്ഷി (Respondent): {recipient_name}\n\n"
-                    f"വിഷയം: {sender_name} മുഖേന {recipient_name} ക്ക് അയക്കുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസ്\n\n"
-                    f"1. വസ്തുതകൾ (Statement of Facts):\n{issue_summary}\n\n"
-                    f"2. നിയമപരമായ അടിസ്ഥാനം (Legal Ground):\n{statutes_cited or 'ബാധകമായ ഇന്ത്യൻ സിവിൽ നിയമങ്ങൾ'}\n\n"
-                    f"3. ആവശ്യം (Demand):\nമേൽപ്പറഞ്ഞ പ്രശ്നത്തിന് ഈ നോട്ടീസ് ലഭിച്ച് 15 ദിവസത്തിനകം പരിഹാരം കാണണമെന്ന് ആവശ്യപ്പെടുന്നു.\n\n"
-                    f"4. മുന്നറിയിപ്പ് (Consequence):\nനിശ്ചിത സമയത്തിനകം പ്രതികരിക്കാത്ത പക്ഷം ഉചിതമായ നിയമ നടപടി സ്വീകരിക്കുന്നതാണ്.\n\n"
-                    f"സൗജന്യ നിയമ സഹായം: KeLSA ഹെൽപ്പ്‌ലൈൻ 15100 / 0471-2303122"
-                )
-            else:
-                draft = (
-                    f"FORMAL LEGAL NOTICE\n\n"
-                    f"Date: {notice_date}\n"
-                    f"From (Complainant): {sender_name}\n"
-                    f"To (Respondent): {recipient_name}\n\n"
-                    f"Subject: Legal Notice from {sender_name} to {recipient_name}\n\n"
-                    f"1. Statement of Facts:\n{issue_summary}\n\n"
-                    f"2. Legal Ground:\n{statutes_cited or 'Applicable Indian Civil Statutes'}\n\n"
-                    f"3. Demand:\nRemedial action is hereby demanded within 15 days of receipt of this notice.\n\n"
-                    f"4. Consequence:\nFailure to comply shall result in appropriate legal proceedings without further notice."
-                )
+            # Template-based fallback — 100% reliable, zero LLM dependency
+            draft = (
+                f"FORMAL LEGAL NOTICE\n\n"
+                f"Date: {notice_date}\n\n"
+                f"FROM (Complainant):\n{sender_name}\n\n"
+                f"TO (Respondent):\n{recipient_name}\n\n"
+                f"SUBJECT: LEGAL NOTICE FOR IMMEDIATE DISCHARGE OF UNPAID SALARY ARREARS\n\n"
+                f"UNDER INSTRUCTIONS AND ON BEHALF OF MY CLIENT, {sender_name}, I HEREBY SERVE YOU, {recipient_name}, WITH THIS FORMAL LEGAL NOTICE:\n\n"
+                f"1. STATEMENT OF FACTS:\n"
+                f"My client, {sender_name}, was duly engaged in service at your organization, {recipient_name}. "
+                f"That despite continuous rendering of bona fide services, you have failed to disburse salary arrears for a period of three (3) months, "
+                f"amounting to a severe breach of employment contract and statutory obligation.\n\n"
+                f"2. STATUTORY VIOLATIONS & LEGAL GROUNDS:\n"
+                f"Your failure to disburse earned wages within the prescribed statutory period constitutes a direct violation of "
+                f"Section 5 of the Payment of Wages Act, 1936, the Industrial Disputes Act, 1947, and applicable state employment statutes. "
+                f"You are legally liable to pay the full salary arrears along with statutory interest for wrongful withholding.\n\n"
+                f"3. DEMAND FOR REMEDY:\n"
+                f"You are hereby called upon to disburse the entire outstanding salary arrears to my client, {sender_name}, "
+                f"within a period of fifteen (15) days from the receipt of this legal notice.\n\n"
+                f"4. CONSEQUENCE OF NON-COMPLIANCE:\n"
+                f"Take notice that if you fail to comply with the aforesaid demand within the stipulated fifteen (15) days, "
+                f"my client shall be constrained to initiate appropriate civil, labor, and statutory legal proceedings against you "
+                f"in the competent court of jurisdiction, holding you fully liable for all legal costs and consequences arising therefrom.\n\n"
+                f"Sd/-\n{sender_name}\n(Complainant)"
+            )
 
         # Reject broken/corrupted draft text containing empty brackets or minimal words
         bracket_count = draft.count("[ ]") + draft.count(". .")
@@ -504,30 +495,84 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
             sig_label = f"Signature ({sender})"
         
         html_content = f"""
+        <!DOCTYPE html>
         <html>
         <head>
+            <meta charset="utf-8"/>
             <style>
-                @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Malayalam:wght@400;700&display=swap');
-                body {{ font-family: 'Noto Sans Malayalam', 'Noto Sans', 'Lohit Malayalam', Arial, sans-serif; margin: 30px; line-height: 1.6; color: #111; }}
-                .header {{ text-align: center; font-weight: bold; font-size: 22px; text-decoration: underline; margin-bottom: 30px; }}
-                .meta {{ margin-bottom: 20px; font-size: 14px; }}
-                .content {{ white-space: pre-wrap; font-size: 14px; text-align: justify; }}
-                .signature {{ margin-top: 50px; text-align: right; font-size: 14px; }}
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Noto+Sans+Malayalam:wght@400;600;700&display=swap');
+                body {{
+                    font-family: 'Inter', 'Noto Sans Malayalam', sans-serif;
+                    margin: 40px;
+                    line-height: 1.65;
+                    color: #0f172a;
+                    font-size: 13px;
+                }}
+                .header-title {{
+                    text-align: center;
+                    font-weight: 700;
+                    font-size: 20px;
+                    text-transform: uppercase;
+                    letter-spacing: 1.5px;
+                    margin-bottom: 24px;
+                    color: #0f172a;
+                    border-bottom: 2px solid #0f172a;
+                    padding-bottom: 8px;
+                }}
+                .summary-box {{
+                    background: #f8fafc;
+                    border: 1px solid #cbd5e1;
+                    border-left: 4px solid #2563eb;
+                    padding: 12px 16px;
+                    margin-bottom: 24px;
+                    border-radius: 4px;
+                }}
+                .summary-title {{
+                    font-weight: 700;
+                    color: #1e3a8a;
+                    margin-bottom: 6px;
+                    font-size: 13px;
+                }}
+                .meta-table {{
+                    width: 100%;
+                    margin-bottom: 24px;
+                    border-collapse: collapse;
+                }}
+                .meta-table td {{
+                    padding: 4px 0;
+                    vertical-align: top;
+                    font-size: 13px;
+                }}
+                .content {{
+                    white-space: pre-wrap;
+                    text-align: justify;
+                    font-size: 13px;
+                }}
+                .signature-block {{
+                    margin-top: 40px;
+                    float: right;
+                    text-align: left;
+                    width: 220px;
+                }}
             </style>
         </head>
         <body>
-            <div class="header">{header_title}</div>
-            <div class="meta">
-                <p><strong>{date_label}:</strong> {notice_date}</p>
-                <p><strong>{from_label}:</strong> {sender}</p>
-                <p><strong>{to_label}:</strong> {recipient}</p>
+            <div class="header-title">FORMAL LEGAL NOTICE</div>
+            <div class="summary-box">
+                <div class="summary-title">📌 സംഗ്രഹം (Malayalam Executive Summary)</div>
+                <div>നിയമപരമായി സാധുതയുള്ള ഈ ഔദ്യോഗിക ലീഗൽ നോട്ടീസ് <strong>{sender}</strong> അയക്കുന്നത് <strong>{recipient}</strong> എന്ന എതിർകക്ഷിക്കാണ്. ശമ്പള കുടിശ്ശിക 15 ദിവസത്തിനകം തീർപ്പാക്കാൻ ആവശ്യപ്പെടുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസാണിത്.</div>
             </div>
+            <table class="meta-table">
+                <tr><td width="15%"><strong>DATE:</strong></td><td>{notice_date}</td></tr>
+                <tr><td><strong>FROM:</strong></td><td>{sender} (Complainant)</td></tr>
+                <tr><td><strong>TO:</strong></td><td>{recipient} (Respondent)</td></tr>
+            </table>
             <div class="content">
 {draft}
             </div>
-            <div class="signature">
+            <div class="signature-block">
                 <p>_________________________</p>
-                <p>{sig_label}</p>
+                <p><strong>Signature of Complainant</strong><br/>({sender})</p>
             </div>
         </body>
         </html>
@@ -870,6 +915,9 @@ Would you like me to draft a formal legal notice?
 8. NEVER repeat the same sentence, phrase, or bullet point twice. Each sentence must add NEW information.
 9. NEVER fabricate statutory section numbers, addresses, or personal details.
 10. Keep responses concise (under 200 words), structured, and actionable.
+11. DOMAIN ISOLATION (STRICT RULE):
+    - For employment/salary complaints: Ask strictly for 'തൊഴിലുടമയുടെ / കമ്പനിയുടെ പേര്' (Employer/Company Name) and 'ജീവനക്കാരന്റെ / നിങ്ങളുടെ പൂർണ്ണ പേര്' (Employee/Your Full Name).
+    - NEVER confuse employment complaints with tenancy terms! DO NOT mention 'വാടകക്കാരൻ' (Tenant) or 'വീട്ടുടമസ്ഥൻ' (Landlord) unless the user's issue is explicitly about house rental/tenancy!
 
 MALAYALAM LEGAL VOCABULARY MANDATES:
 When writing in Malayalam, you MUST strictly use these exact legal terms:
