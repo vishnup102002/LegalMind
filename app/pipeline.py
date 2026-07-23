@@ -948,8 +948,8 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
         # --- Deterministic Name Extraction & Direct Tool Call ---
         # If user provides explicit sender/recipient names, bypass LLM and call tool directly.
         # This eliminates LLM flakiness for notice generation when names are clearly provided.
-        sender_match = re.search(r'(?:അയക്കുന്നയാൾ|ഫ്രം|sender|from|complainant)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
-        recipient_match = re.search(r'(?:ലഭിക്കേണ്ടയാൾ|സ്വീകരിക്കുന്നയാൾ|എതിർകക്ഷി|ടൂ|to|recipient|respondent)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        sender_match = re.search(r'(?:അയക്കുന്നയാൾ|ഫ്രം|sender|from|complainant|നിങ്ങളുടെ\s*പൂർണ്ണ\s*പേര്|പൂർണ്ണ\s*പേര്|പേര്)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
+        recipient_match = re.search(r'(?:ലഭിക്കേണ്ടയാൾ|സ്വീകരിക്കുന്നയാൾ|എതിർകക്ഷി|ടൂ|to|recipient|respondent|തൊഴിലുടമയുടെ\s*പേര്|ൊഴിലുടമയുടെ\s*പേര്|കമ്പനിയുടെ\s*പേര്|കമ്പനി)\s*[:：]\s*([^,\n]+)', normalized_query, re.IGNORECASE)
         
         if sender_match and recipient_match:
             s_name = sender_match.group(1).strip()

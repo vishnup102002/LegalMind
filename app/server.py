@@ -748,10 +748,15 @@ async def whatsapp_webhook(
             else:
                 download_url = f"http://localhost:8080{raw_url}"
                 
-            # Replace the long draft text with a clean instructions note (using LLM-extracted names)
+            # Replace the long draft text with a clean instructions note AND direct HTTPS download link
             sender_name = result.get("sender_name")
             recipient_name = result.get("recipient_name")
-            whatsapp_reply = get_pdf_instructions_note(session.get("lang", "en"), sender_name, recipient_name)
+            base_note = get_pdf_instructions_note(session.get("lang", "en"), sender_name, recipient_name)
+            
+            if session.get("lang") == "ml":
+                whatsapp_reply = f"{base_note}\n\n📥 **ഡൗൺലോഡ് ലിങ്ക് (Download PDF):**\n{download_url}"
+            else:
+                whatsapp_reply = f"{base_note}\n\n📥 **Download Link (PDF):**\n{download_url}"
 
         # 6. Unified send: text + TTS audio (for voice) + document (if any)
         send_whatsapp_response(From, whatsapp_reply, session, modality=current_modality, download_url=download_url)
