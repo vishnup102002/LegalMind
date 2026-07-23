@@ -622,10 +622,10 @@ def detect_text_language(text: str) -> str:
 @app.post("/api/whatsapp/webhook")
 async def whatsapp_webhook(
     request: Request,
-    Body: Optional[str] = Form(None),
-    From: Optional[str] = Form(None),
-    MediaUrl0: Optional[str] = Form(None),
-    NumMedia: Optional[str] = Form("0")
+    Body: str = Form(None),
+    From: str = Form(None),
+    MediaUrl0: str = Form(None),
+    NumMedia: str = Form("0")
 ):
     raw_from = From or "whatsapp:+14155238886"
     user_message = (Body or "").strip()
