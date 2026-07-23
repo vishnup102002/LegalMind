@@ -1052,11 +1052,13 @@ When writing in Malayalam, you MUST strictly use these exact legal terms:
                 response_text = "The AI service is currently experiencing high demand. Please try again in a few moments.\n\n📞 For immediate free legal assistance, contact the Kerala State Legal Services Authority (KeLSA) Helpline at 15100 / 0471-2303122."
             retrieved_context = ""
 
-        # Post-generation repetition cleanup
+        # Post-generation repetition cleanup & null guard
+        response_text = response_text or ""
         response_text = self._clean_repetitive_output(response_text)
 
         # Strip hallucinated example.com / fake URLs from LLM response
-        response_text = re.sub(r'https?://(?:www\.)?example\.com[^\s\)]*', '', response_text, flags=re.IGNORECASE).strip()
+        if response_text:
+            response_text = re.sub(r'https?://(?:www\.)?example\.com[^\s\)]*', '', response_text, flags=re.IGNORECASE).strip()
 
         # Post-generation citation shield verification & active re-retrieval loop
         is_grounded = self._verify_citation_grounding(response_text, retrieved_context)
