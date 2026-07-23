@@ -896,15 +896,18 @@ LEGAL NOTICE DRAFTING CONTRACT (STRICT MANDATORY RULES):
         else:
             final_recipient = None
 
-        # ROLE INVERSION VALIDATION GATE: Discard if sender_name == recipient_name
-        if sender_name and final_recipient:
-            clean_s = re.sub(r'[^a-zA-Z\u0D00-\u0D7F]', '', sender_name).lower()
-            clean_r = re.sub(r'[^a-zA-Z\u0D00-\u0D7F]', '', final_recipient).lower()
-            if clean_s == clean_r or clean_s in clean_r or clean_r in clean_s:
-                logger.warning(f"Role Inversion Gate Triggered: sender '{sender_name}' and recipient '{final_recipient}' are identical/overlapping. Resetting invalid sender.")
-                sender_name = None
-
-        return {"sender_name": sender_name, "recipient_name": final_recipient}
+        # Pydantic Structural Validation Model Gate
+        from app.models import LegalNoticeSlots, LegalDomain
+        try:
+            slots_obj = LegalNoticeSlots(
+                sender_name=sender_name,
+                recipient_name=final_recipient,
+                company_name=company_name
+            )
+            return {"sender_name": slots_obj.sender_name, "recipient_name": slots_obj.recipient_name, "slots_model": slots_obj}
+        except Exception as err:
+            logger.warning(f"Pydantic LegalNoticeSlots validation gate flagged invalid/inverted slots: {err}")
+            return {"sender_name": None, "recipient_name": final_recipient, "slots_model": None}
 
     def _verify_citation_grounding(self, response_text: str, retrieved_context: str) -> bool:
         """Post-generation statutory citation shield gate.
