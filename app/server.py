@@ -622,17 +622,17 @@ def detect_text_language(text: str) -> str:
 @app.post("/api/whatsapp/webhook")
 async def whatsapp_webhook(
     request: Request,
-    Body: str = Form(""),
-    From: str = Form("whatsapp:+14155238886"),
-    MediaUrl0: str = Form(None),
-    NumMedia: str = Form("0")
+    Body: Optional[str] = Form(None),
+    From: Optional[str] = Form(None),
+    MediaUrl0: Optional[str] = Form(None),
+    NumMedia: Optional[str] = Form("0")
 ):
-    raw_from = "whatsapp:+14155238886"
-    user_message = ""
+    raw_from = From or "whatsapp:+14155238886"
+    user_message = (Body or "").strip()
     content_type = request.headers.get("content-type", "").lower()
 
-    # 1. Parse JSON payloads (Meta WhatsApp Business API or TestClient JSON)
-    if "application/json" in content_type:
+    # 1. Parse JSON payloads if Body parameter was not in Form data
+    if not user_message and "application/json" in content_type:
         try:
             data = await request.json()
             # Handle Meta WhatsApp Business API Nested Payload
@@ -651,17 +651,9 @@ async def whatsapp_webhook(
         except Exception as json_err:
             logger.warning(f"JSON payload parsing failed: {json_err}")
 
-    # 2. Fallback to Form Data (Twilio Standard Webhook)
-    if not user_message:
-        try:
-            form_data = await request.form()
-            raw_from = form_data.get("From") or form_data.get("from") or From or raw_from
-            user_message = form_data.get("Body") or form_data.get("message") or Body or ""
-        except Exception:
-            raw_from = From or raw_from
-            user_message = Body or ""
-
     user_message = str(user_message).strip()
+    logger.info(f"Incoming WhatsApp message from '{raw_from}': '{user_message}'")
+
     if not user_message and NumMedia == "0":
         logger.warning(f"Empty or unparseable webhook payload received from {raw_from}")
         return {"status": "ignored", "reason": "empty_payload"}
