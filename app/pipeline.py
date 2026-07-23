@@ -791,6 +791,18 @@ LEGAL NOTICE DRAFTING CONTRACT (STRICT MANDATORY RULES):
 
         # Max steps reached or tool error — force final text synthesis without tools
         final_content = self._call_llm_raw(system_prompt, current_messages)
+        if not final_content or len(final_content.strip()) < 10:
+            if retrieved_context:
+                if language == "ml":
+                    final_content = f"നിങ്ങളുടെ പരാതി പരിശോധിച്ചു. നിയമപരമായ അവലോകനം താഴെ നൽകുന്നു:\n\n{retrieved_context}\n\nനിങ്ങളുടെ പരാതിപരിഹാരത്തിനായി തൊഴിലുടമയ്ക്ക് ലീഗൽ നോട്ടീസ് അയക്കാവുന്നതാണ്. നോട്ടീസ് തയ്യാറാക്കാൻ നിങ്ങളുടെ പൂർണ്ണ പേരും തൊഴിലുടമയുടെ പേരും നൽകുക."
+                else:
+                    final_content = f"We have reviewed your complaint. Relevant legal statutory context:\n\n{retrieved_context}\n\nYou may issue a formal legal notice. Please provide your full name and the opposing party's name to compile the document."
+            else:
+                if language == "ml":
+                    final_content = "നിങ്ങളുടെ പരാതി ലഭിച്ചിട്ടുണ്ട്. കൂടുതൽ നിയമപരമായ വിവരങ്ങൾ അല്ലെങ്കിൽ ലീഗൽ നോട്ടീസ് തയ്യാറാക്കുന്നതിനായി നിങ്ങളുടെ പൂർണ്ണ പേരും തൊഴിലുടമയുടെ പേരും നൽകുക."
+                else:
+                    final_content = "Your complaint has been received. To draft a formal legal notice, please provide your full name and the opposing party's name."
+
         return {"content": final_content, "retrieved_context": retrieved_context}
 
     def _clean_repetitive_output(self, text: str) -> str:

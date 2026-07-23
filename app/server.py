@@ -627,18 +627,44 @@ async def whatsapp_webhook(
     MediaUrl0: str = Form(None),
     NumMedia: str = Form("0")
 ):
-    # Support both Form data and JSON payloads for API test clients
-    if request.headers.get("content-type", "").startswith("application/json"):
+    raw_from = "whatsapp:+14155238886"
+    user_message = ""
+    content_type = request.headers.get("content-type", "").lower()
+
+    # 1. Parse JSON payloads (Meta WhatsApp Business API or TestClient JSON)
+    if "application/json" in content_type:
         try:
-            json_body = await request.json()
-            raw_from = json_body.get("from") or json_body.get("From") or "whatsapp:+14155238886"
-            user_message = (json_body.get("message") or json_body.get("Body") or "").strip()
+            data = await request.json()
+            # Handle Meta WhatsApp Business API Nested Payload
+            if isinstance(data, dict) and "entry" in data:
+                try:
+                    msg_obj = data["entry"][0]["changes"][0]["value"]["messages"][0]
+                    raw_from = msg_obj.get("from", raw_from)
+                    user_message = msg_obj.get("text", {}).get("body", "")
+                except (KeyError, IndexError, TypeError):
+                    pass
+
+            # Handle Direct TestClient / Custom JSON Payload
+            if not user_message and isinstance(data, dict):
+                raw_from = data.get("from") or data.get("From") or raw_from
+                user_message = data.get("message") or data.get("Body") or ""
+        except Exception as json_err:
+            logger.warning(f"JSON payload parsing failed: {json_err}")
+
+    # 2. Fallback to Form Data (Twilio Standard Webhook)
+    if not user_message:
+        try:
+            form_data = await request.form()
+            raw_from = form_data.get("From") or form_data.get("from") or From or raw_from
+            user_message = form_data.get("Body") or form_data.get("message") or Body or ""
         except Exception:
-            raw_from = From
-            user_message = Body.strip()
-    else:
-        raw_from = From
-        user_message = Body.strip()
+            raw_from = From or raw_from
+            user_message = Body or ""
+
+    user_message = str(user_message).strip()
+    if not user_message and NumMedia == "0":
+        logger.warning(f"Empty or unparseable webhook payload received from {raw_from}")
+        return {"status": "ignored", "reason": "empty_payload"}
 
     phone_number = str(raw_from).replace("whatsapp:", "")
     session = session_manager.load(phone_number)

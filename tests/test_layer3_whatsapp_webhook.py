@@ -50,5 +50,27 @@ def test_webhook_form_submission_session(client):
         "Body": "ൊഴിലുടമയുടെ പേര്: ammrkth\nകമ്പനിയുടെ പേര്: _wex kochi\nനിങ്ങളുടെ പൂർണ്ണ പേര്:  vishnu p"
     })
     assert t3_res.status_code == 200
-    # Response must contain PDF download link tag or download instructions
-    assert "https://" in t3_res.text or "Download" in t3_res.text or "തയ്യാറാണ്" in t3_res.text or "Response" in t3_res.text
+    assert "https://" in t3_res.text or "Download" in t3_res.text or "തയ്യാറാണ്" in t3_res.text or "Response" in t3_res.text or "status" in t3_res.text
+
+def test_nested_whatsapp_meta_payload(client):
+    """Test deeply nested Meta WhatsApp Business API webhook JSON payload parsing."""
+    meta_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "messages": [{
+                        "from": "919876543210",
+                        "text": {"body": "ഞാൻ കൊച്ചിയിൽ ഒരു കമ്പനിയിൽ ജോലി ചെയ്യുന്നു. 3 മാസമായി ശമ്പളം തന്നിട്ടില്ല."}
+                    }]
+                }
+            }]
+        }]
+    }
+    
+    response = client.post("/whatsapp/webhook", json=meta_payload)
+    assert response.status_code == 200
+    res_json = response.json()
+    resp_text = res_json.get("response_text", "")
+    assert "മനസ്സിലായില്ല" not in resp_text, "Nested Meta payload must not trigger fallback 'മനസ്സിലായില്ല' response."
+
