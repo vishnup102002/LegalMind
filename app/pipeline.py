@@ -414,11 +414,12 @@ LEGAL NOTICE DIRECTION CONTRACT (STRICT MANDATORY RULES):
   "സ്വീകരിക്കുന്നയാൾ / എതിർകക്ഷി (Respondent): {recipient_name}"
   "വിഷയം: {sender_name} മുഖേന {recipient_name} ക്ക് അയക്കുന്ന ഔദ്യോഗിക നിയമ നോട്ടീസ്"
 - NEVER state that the notice is from {recipient_name} to {sender_name}! {sender_name} is the sender/complainant!
+- STRICT DEDUPLICATION: Every numbered point MUST be completely unique. NEVER repeat the same phrase, clause, or sentence across multiple points!
 
 Include these sections:
 1. Header & Subject Line (From {sender_name} To {recipient_name})
-2. Statement of Facts (numbered)
-3. Legal Ground & Statutory Violations
+2. Statement of Facts (numbered, unique points)
+3. Legal Ground & Statutory Violations ( cite Payment of Wages Act 1936 or Kerala Shops & Commercial Establishments Act 1960 if applicable)
 4. Clear Demand / Relief Sought
 5. Period for Compliance & Consequence of Non-Compliance
 6. Signature Block for {sender_name}
@@ -427,8 +428,8 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         
         try:
             draft_messages = [{"role": "user", "content": draft_prompt}]
-            draft = self._call_llm_raw("You are an Indian legal notice drafting system.", draft_messages, temperature=0.1)
-            # Deduplicate repetitive sentence loops from LLM synthesis
+            draft = self._call_llm_raw("You are an Indian legal notice drafting system. Write concise, non-repetitive legal text.", draft_messages, temperature=0.1)
+            # Deduplicate repetitive sentence & phrase loops from LLM synthesis
             draft = self._clean_repetitive_output(draft)
         except Exception as e:
             logger.error(f"Failed to generate notice draft text: {e}")
@@ -742,11 +743,17 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
         return {"content": final_content, "retrieved_context": retrieved_context}
 
     def _clean_repetitive_output(self, text: str) -> str:
-        """Deduplicates repetitive sentences or looped phrases from LLM generation."""
+        """Deduplicates repetitive sentences, phrase loops, or duplicate bullet points from LLM generation."""
         if not text or len(text) < 20:
             return text
 
-        # Split into lines/paragraphs first to preserve formatting structure
+        # Step 1: Substring and word-phrase loop removal (collapses back-to-back phrase loops like 'abc abc abc')
+        # Catch repeating 2-to-8 word sequences
+        text = re.sub(r'(\b[\w\u0D00-\u0D7F]+(?:\s+[\w\u0D00-\u0D7F]+){2,8}\b)(?:\s+\1)+', r'\1', text, flags=re.IGNORECASE)
+        # Catch repeating 12+ char string loops
+        text = re.sub(r'(.{12,120}?)\1{2,}', r'\1', text, flags=re.DOTALL)
+
+        # Step 2: Paragraph & Line-level deduplication with leading bullet/number stripping
         lines = text.split("\n")
         cleaned_lines = []
         seen_lines = set()
@@ -758,7 +765,6 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 continue
 
             # Check sentence-level repetition within paragraph line
-            # Split by punctuation (Malayalam or English)
             sentences = re.split(r'([.?!।\n]+)', line_str)
             deduped_parts = []
             seen_sentences = set()
@@ -770,18 +776,15 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                     i += 1
                     continue
 
-                # If it's punctuation, append directly
                 if re.match(r'^[.?!।\n]+$', part):
                     deduped_parts.append(part)
                     i += 1
                     continue
 
                 part_clean = re.sub(r'\s+', ' ', part).strip().lower()
-                # Ignore very short tokens (e.g. bullet symbols)
                 if len(part_clean) > 8:
                     if part_clean in seen_sentences:
                         i += 1
-                        # Skip attached trailing punctuation as well if next token is punct
                         if i < len(sentences) and re.match(r'^[.?!।\n]+$', sentences[i]):
                             i += 1
                         continue
@@ -791,14 +794,16 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
                 i += 1
 
             line_reconstructed = "".join(deduped_parts).strip()
-            line_key = line_reconstructed.lower()
+            
+            # Strip leading numbers/bullets (e.g. '1.', '2.', '3)', '-', '*') to extract core content key
+            content_key = re.sub(r'^\s*[\d\.\-\*\•\)\:\(\s]+', '', line_reconstructed).strip().lower()
 
-            # Skip whole repeated lines if line is a duplicate non-header line
-            if len(line_key) > 15 and line_key in seen_lines and not line_key.startswith("**"):
+            # Skip whole repeated lines if line content is a duplicate non-header line
+            if len(content_key) > 12 and content_key in seen_lines and not line_reconstructed.startswith("**"):
                 continue
 
-            if len(line_key) > 15:
-                seen_lines.add(line_key)
+            if len(content_key) > 12:
+                seen_lines.add(content_key)
 
             cleaned_lines.append(line_reconstructed)
 
@@ -842,7 +847,9 @@ Do not invent addresses — use "{placeholder_text}" for unknown addresses."""
 
 CRITICAL BEHAVIORAL CONTRACT:
 1. You MUST respond strictly in {lang_name} language.
-2. Whenever the user requests a legal notice or provides names (e.g., 'അയക്കുന്നയാൾ: vishnu, ലഭിക്കേണ്ടയാൾ: wex company hr' or 'ഫ്രം: വിഷ്ണു, ടൂ: wex hr'), call tool 'draft_legal_notice' IMMEDIATELY.
+2. When the user requests a legal notice or provides notice details:
+   - If BOTH Sender Name and Recipient/Company Name are explicitly provided by the user (e.g., 'ഫ്രം: വിഷ്ണു പി, ടൂ: wex kochi' or 'Sender: Vishnu, Recipient: Wex Ltd'), call tool 'draft_legal_notice' IMMEDIATELY.
+   - If Sender Name or Recipient/Company Name is missing, DO NOT call 'draft_legal_notice'. Politely ask the user to provide their Full Name and Recipient/Company Name first in {lang_name}.
 3. Use the 'search_statutes' tool ONLY when the user describes an initial legal problem or asks about their rights/remedies.
 4. When presenting legal rights, you MUST use this EXACT structure — each section ONCE, no repetition:
 
@@ -859,8 +866,8 @@ Would you like me to draft a formal legal notice?
 
 5. STRICT FACT ANCHORING: NEVER alter, swap, or hallucinate user-provided facts, names, or locations (e.g., if the user says 'കൊച്ചി' / 'Kochi', keep it strictly as Kochi — NEVER change it to Kozhikode or any other location!).
 6. PROBABILISTIC LEGAL ADVISORY: NEVER make absolute guarantees or promises like 'നിങ്ങൾക്ക് ലഭിക്കും' ('You WILL get compensation'). Always use cautious, legally accurate probabilistic phrases like 'നിങ്ങൾക്ക് അർഹതയുണ്ടായേക്കാം' ('You MAY be entitled to') or 'നിയമപരമായ പരിഹാരം തേടാവുന്നതാണ്' ('Legal remedies may be pursued'). No AI can guarantee legal outcomes.
-7. NEVER repeat the same sentence or idea twice. Each sentence must add NEW information.
-8. If Sender or Recipient names are missing when drafting a notice, politely ask for them in {lang_name}.
+7. NO DUAL CONTRADICTORY OUTPUTS: If tool 'draft_legal_notice' is executed and returns a PDF download link, DO NOT ask the user for missing details in your text response! Simply present the download link and instructions to the user.
+8. NEVER repeat the same sentence, phrase, or bullet point twice. Each sentence must add NEW information.
 9. NEVER fabricate statutory section numbers, addresses, or personal details.
 10. Keep responses concise (under 200 words), structured, and actionable.
 
