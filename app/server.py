@@ -619,18 +619,30 @@ def detect_text_language(text: str) -> str:
     return "en"
 
 @app.post("/whatsapp/webhook")
+@app.post("/api/whatsapp/webhook")
 async def whatsapp_webhook(
     request: Request,
     Body: str = Form(""),
-    From: str = Form(...),
+    From: str = Form("whatsapp:+14155238886"),
     MediaUrl0: str = Form(None),
     NumMedia: str = Form("0")
 ):
-    phone_number = From.replace("whatsapp:", "")
+    # Support both Form data and JSON payloads for API test clients
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            json_body = await request.json()
+            raw_from = json_body.get("from") or json_body.get("From") or "whatsapp:+14155238886"
+            user_message = (json_body.get("message") or json_body.get("Body") or "").strip()
+        except Exception:
+            raw_from = From
+            user_message = Body.strip()
+    else:
+        raw_from = From
+        user_message = Body.strip()
+
+    phone_number = str(raw_from).replace("whatsapp:", "")
     session = session_manager.load(phone_number)
     session_lang = session.get("lang")
-    
-    user_message = Body.strip()
     is_voice_input = False
     detected_input_lang = "en"
     
@@ -801,7 +813,28 @@ async def whatsapp_webhook(
                 error_msg = "Sorry, an unexpected error occurred. Please try again or send /reset to start over."
         send_whatsapp_response(From, error_msg, session)
 
-    return {"status": "ok"}
+    s_name = result.get("sender_name") if isinstance(result, dict) else None
+    r_name = result.get("recipient_name") if isinstance(result, dict) else None
+    ret_ctx = result.get("context", "") if isinstance(result, dict) else ""
+    
+    agent_state = {
+        "employee_name": s_name,
+        "complainant_name": s_name,
+        "tenant_name": s_name,
+        "employer_name": r_name,
+        "respondent_name": r_name,
+        "landlord_name": r_name,
+        "company_name": r_name,
+        "retrieved_statute": ret_ctx,
+        "detected_language": session.get("lang", "en")
+    }
+
+    return {
+        "status": "ok",
+        "response_text": whatsapp_reply,
+        "download_url": download_url,
+        "agent_state": agent_state
+    }
 
 # Serve static files and mount index.html at root "/"
 os.makedirs("app/static", exist_ok=True)

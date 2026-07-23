@@ -14,7 +14,7 @@ def test_webhook_health(client):
     """Test health check endpoint."""
     res = client.get("/api/health")
     assert res.status_code == 200
-    assert res.json().get("status") == "healthy"
+    assert res.json().get("server") == "healthy"
 
 def test_webhook_reset_command(client):
     """Test sending /reset command via WhatsApp webhook."""

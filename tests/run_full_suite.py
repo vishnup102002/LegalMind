@@ -22,7 +22,8 @@ def main():
     test_files = [
         "tests/test_layer1_pydantic_units.py",
         "tests/test_layer2_deepeval_metrics.py",
-        "tests/test_layer3_whatsapp_webhook.py"
+        "tests/test_layer3_whatsapp_webhook.py",
+        "tests/test_layer3_diverse_legal_domains.py"
     ]
 
     print("🚀 Launching PyTest Test Execution Harness...\n")
